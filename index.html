@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Mitschrift</title>
+<meta name="theme-color" content="#14161a">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Mitschrift">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <button class="icon-btn" id="btnBack" hidden aria-label="Zurück">‹</button>
+  <h1 id="title">Mitschrift</h1>
+  <button class="icon-btn" id="btnSettings" aria-label="Einstellungen">⚙</button>
+</header>
+
+<main>
+  <!-- Startseite -->
+  <section id="viewHome" class="view">
+    <div class="recorder">
+      <div class="timer" id="timer">00:00</div>
+      <canvas id="level" width="600" height="60"></canvas>
+      <div class="rec-controls">
+        <button class="ctl" id="btnPause" hidden>Pause</button>
+        <button class="rec" id="btnRec" aria-label="Aufnahme starten"><span></span></button>
+        <button class="ctl" id="btnStop" hidden>Fertig</button>
+      </div>
+      <div class="hint" id="recHint">Tippen zum Aufnehmen</div>
+      <label class="toggle"><input type="checkbox" id="optLive"> Live-Mitschrift während der Aufnahme</label>
+      <div class="live" id="liveText" hidden></div>
+    </div>
+
+    <div class="list-head">
+      <h2>Aufnahmen</h2>
+      <label class="link-btn">Datei importieren<input type="file" id="fileImport" accept="audio/*,video/*" hidden></label>
+    </div>
+    <input class="search" id="search" type="search" placeholder="In allen Gesprächen suchen">
+    <ul class="list" id="list"></ul>
+    <p class="empty" id="empty">Noch keine Aufnahmen.</p>
+  </section>
+
+  <!-- Detail -->
+  <section id="viewDetail" class="view" hidden>
+    <input class="rename" id="dTitle" aria-label="Titel">
+    <div class="meta" id="dMeta"></div>
+    <audio id="dAudio" controls preload="metadata"></audio>
+    <div class="status" id="dStatus" hidden></div>
+    <nav class="tabs">
+      <button data-tab="sum" class="active">Zusammenfassung</button>
+      <button data-tab="tx">Transkript</button>
+      <button data-tab="ask">Fragen</button>
+    </nav>
+    <div class="tab" id="tabSum"><div class="md" id="dSummary"></div></div>
+    <div class="tab" id="tabTx" hidden><div class="tx" id="dTranscript"></div></div>
+    <div class="tab" id="tabAsk" hidden>
+      <div id="askLog"></div>
+      <form id="askForm" class="ask">
+        <input id="askInput" placeholder="z. B. Was hat er zum Preis gesagt?" autocomplete="off">
+        <button>Fragen</button>
+      </form>
+    </div>
+    <div class="actions">
+      <button id="aShare">Teilen</button>
+      <button id="aCopy">Kopieren</button>
+      <button id="aRetx">Neu transkribieren</button>
+      <button id="aResum">Neu zusammenfassen</button>
+      <button id="aDelete" class="danger">Löschen</button>
+    </div>
+  </section>
+
+  <!-- Einstellungen -->
+  <section id="viewSettings" class="view" hidden>
+    <h2>Transkription</h2>
+    <label>Groq API-Schlüssel (Whisper, kostenloser Einstieg)
+      <input id="sGroq" type="password" autocomplete="off" placeholder="gsk_...">
+    </label>
+    <p class="small">Schlüssel holen: <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>. Ohne Schlüssel nutzt die App nur die Live-Mitschrift des Browsers.</p>
+    <label>Sprache
+      <select id="sLang">
+        <option value="de">Deutsch</option>
+        <option value="tr">Türkisch</option>
+        <option value="en">Englisch</option>
+        <option value="">Automatisch erkennen</option>
+      </select>
+    </label>
+
+    <h2>Zusammenfassung</h2>
+    <label>Anthropic API-Schlüssel (Claude, optional)
+      <input id="sClaude" type="password" autocomplete="off" placeholder="sk-ant-...">
+    </label>
+    <p class="small">Ist ein Claude-Schlüssel hinterlegt, fasst Claude zusammen. Sonst übernimmt das Groq mit demselben Schlüssel wie oben. Schlüssel holen: <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>.</p>
+    <label>Claude-Modell
+      <input id="sClaudeModel" placeholder="claude-sonnet-5-5">
+    </label>
+    <label>Groq-Modell für Zusammenfassung
+      <input id="sGroqModel" placeholder="llama-3.3-70b-versatile">
+    </label>
+    <label>Eigene Anweisung für Zusammenfassungen (optional)
+      <textarea id="sPrompt" rows="3" placeholder="z. B. Achte besonders auf Preise, Termine und Statik-Fragen."></textarea>
+    </label>
+    <button id="sSave" class="primary">Speichern</button>
+
+    <h2>Daten</h2>
+    <p class="small">Alle Aufnahmen bleiben auf diesem Handy (im Browser-Speicher). Zum Transkribieren geht das Audio an Groq, zum Zusammenfassen der Text an Claude oder Groq. Die Schlüssel liegen nur auf diesem Gerät.</p>
+    <p class="small"><b>Wichtig:</b> Gespräche nur aufnehmen, wenn alle Beteiligten einverstanden sind (§ 201 StGB).</p>
+    <p class="small" id="sStorage"></p>
+  </section>
+</main>
+
+<div class="toast" id="toast" hidden></div>
+<script src="app.js"></script>
+</body>
+</html>
