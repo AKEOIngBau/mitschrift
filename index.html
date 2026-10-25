@@ -24,6 +24,7 @@
 <main>
   <!-- Startseite -->
   <section id="viewHome" class="view">
+    <button class="banner" id="keyBanner" hidden>Noch kein Groq-Schlüssel gespeichert. Ohne ihn gibt es keine Transkription und Zusammenfassung. <b>Jetzt eintragen ›</b></button>
     <div class="recorder">
       <div class="timer" id="timer">00:00</div>
       <canvas id="level" width="600" height="60"></canvas>
@@ -81,6 +82,7 @@
     <label>Groq API-Schlüssel (Whisper, kostenloser Einstieg)
       <input id="sGroq" type="password" autocomplete="off" placeholder="gsk_...">
     </label>
+    <p class="small" id="sGroqState"></p>
     <p class="small">Schlüssel holen: <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>. Ohne Schlüssel nutzt die App nur die Live-Mitschrift des Browsers.</p>
     <label>Sprache
       <select id="sLang">
@@ -105,7 +107,8 @@
     <label>Eigene Anweisung für Zusammenfassungen (optional)
       <textarea id="sPrompt" rows="3" placeholder="z. B. Achte besonders auf Preise, Termine und Statik-Fragen."></textarea>
     </label>
-    <button id="sSave" class="primary">Speichern</button>
+    <button id="sSave" class="primary">Speichern und prüfen</button>
+    <p class="small">Alles wird beim Tippen automatisch gespeichert. iPhone: Den Schlüssel in der App vom Startbildschirm eintragen, nicht in Safari, denn beide haben getrennte Speicher.</p>
 
     <h2>Daten</h2>
     <p class="small">Alle Aufnahmen bleiben auf diesem Handy (im Browser-Speicher). Zum Transkribieren geht das Audio an Groq, zum Zusammenfassen der Text an Claude oder Groq. Die Schlüssel liegen nur auf diesem Gerät.</p>

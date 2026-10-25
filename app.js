@@ -451,7 +451,9 @@ async function processRec(id, { retranscribe = false, resummarize = false } = {}
   try {
     let r = await getRec(id);
     if (!r) return;
-    if ((!r.transcript || retranscribe) && settings.groq && r.chunks.length) {
+    // Nur Live-Text vorhanden und noch keine Zusammenfassung: mit Whisper sauber neu transkribieren
+    const onlyLive = r.transcript && !r.transcript.segments?.length && !r.summary;
+    if ((!r.transcript || retranscribe || onlyLive) && settings.groq && r.chunks.length) {
       const segments = [];
       for (let i = 0; i < r.chunks.length; i++) {
         await updateRec(id, { status: 'transcribing', progress: `Transkribiere Teil ${i + 1} von ${r.chunks.length} …`, error: '' });
@@ -618,6 +620,7 @@ function fillSettings() {
   $('#sClaudeModel').value = settings.claudeModel;
   $('#sGroqModel').value = settings.groqModel;
   $('#sPrompt').value = settings.prompt;
+  updateKeyState();
   navigator.storage?.estimate?.().then((e) => {
     $('#sStorage').textContent = `Belegter Speicher: ${(e.usage / 1048576).toFixed(1)} MB von etwa ${(e.quota / 1073741824).toFixed(1)} GB.`;
   });
@@ -693,7 +696,9 @@ $('#aDelete').onclick = async () => {
   location.hash = '#/';
   toast('Gelöscht.');
 };
-$('#sSave').onclick = () => {
+// Einstellungen speichern sich bei jeder Eingabe selbst, der Knopf prüft zusätzlich den Schlüssel
+function readSettingsForm() {
+  const hadKey = !!(settings.groq || settings.claude);
   settings = {
     ...settings,
     groq: $('#sGroq').value.trim(), claude: $('#sClaude').value.trim(), lang: $('#sLang').value,
@@ -701,9 +706,39 @@ $('#sSave').onclick = () => {
     groqModel: $('#sGroqModel').value.trim() || defaults.groqModel, prompt: $('#sPrompt').value.trim(),
   };
   saveSettings();
-  toast('Gespeichert.');
-  resumePending();
+  updateKeyState();
+  if (!hadKey && (settings.groq || settings.claude)) resumePending();
+}
+['#sGroq', '#sClaude', '#sLang', '#sClaudeModel', '#sGroqModel', '#sPrompt'].forEach((s) => $(s).addEventListener('input', readSettingsForm));
+async function checkGroqKey() {
+  if (!settings.groq) return 'missing';
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/models', { headers: { Authorization: 'Bearer ' + settings.groq } });
+    return r.ok ? 'ok' : 'bad';
+  } catch { return 'offline'; }
+}
+function updateKeyState(check) {
+  const el = $('#sGroqState');
+  const has = !!(settings.groq || settings.claude);
+  $('#keyBanner').hidden = !!settings.groq;
+  if (!settings.groq) { el.textContent = 'Kein Groq-Schlüssel gespeichert.'; el.className = 'small bad'; }
+  else if (!check) { el.textContent = 'Groq-Schlüssel gespeichert.'; el.className = 'small good'; }
+  else el.textContent = { ok: '✓ Groq-Schlüssel funktioniert.', bad: '✗ Groq lehnt diesen Schlüssel ab. Bitte neu kopieren.', offline: 'Keine Verbindung, Schlüssel konnte nicht geprüft werden.' }[check] || '';
+  if (check) el.className = 'small ' + (check === 'ok' ? 'good' : 'bad');
+  return has;
+}
+$('#sSave').onclick = async () => {
+  readSettingsForm();
+  const btn = $('#sSave');
+  btn.disabled = true; btn.textContent = 'Prüfe …';
+  const res = await checkGroqKey();
+  btn.disabled = false; btn.textContent = 'Speichern und prüfen';
+  updateKeyState(res === 'missing' ? null : res);
+  if (res === 'ok') { toast('Gespeichert, Schlüssel funktioniert.'); resumePending(); }
+  else if (res === 'missing' && settings.claude) toast('Gespeichert. Für die Transkription fehlt noch der Groq-Schlüssel.', 4000);
 };
+$('#keyBanner').onclick = () => (location.hash = '#/settings');
+$('#dStatus').onclick = () => { if (current?.error && /Schlüssel|Einstellungen/.test(current.error)) location.hash = '#/settings'; };
 
 window.addEventListener('hashchange', route);
 window.addEventListener('beforeunload', (e) => { if (isRecording()) { e.preventDefault(); e.returnValue = ''; } });
@@ -717,9 +752,10 @@ document.addEventListener('visibilitychange', async () => {
 async function resumePending() {
   for (const r of await allRecs()) {
     if (r.status === 'recording' && !isRecording()) await updateRec(r.id, { status: 'pending' });
-    if (['recording', 'pending', 'transcribing', 'summarizing'].includes(r.status) || (r.status === 'error' && !r.transcript && settings.groq)) processRec(r.id);
+    if (['recording', 'pending', 'transcribing', 'summarizing'].includes(r.status) || (r.status === 'error' && !r.summary && (settings.groq || settings.claude))) processRec(r.id);
   }
 }
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+updateKeyState();
 route().then(resumePending);
