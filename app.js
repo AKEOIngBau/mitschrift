@@ -123,12 +123,22 @@ function elapsed() {
 function isRecording() { return !!rec.recorder; }
 
 async function startRecording() {
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    toast('Dieser Browser kann nicht aufnehmen. Bitte Safari (iPhone) oder Chrome (Android) nutzen.', 6000);
+    return;
+  }
+  $('#recHint').textContent = 'Mikrofon wird gestartet …';
   try {
     rec.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
   } catch (e) {
-    toast('Kein Mikrofonzugriff. Bitte in den Browser-Einstellungen erlauben.', 4000);
+    $('#recHint').textContent = 'Tippen zum Aufnehmen';
+    toast('Kein Mikrofonzugriff (' + (e.name || e.message) + '). Bitte in den Einstellungen des Handys erlauben.', 6000);
     return;
   }
+  // Beendet das System das Mikrofon (Anruf, andere App), sauber abschließen statt hängen zu bleiben
+  rec.stream.getAudioTracks().forEach((t) => (t.onended = () => {
+    if (isRecording()) { toast('Das Mikrofon wurde vom Handy beendet. Aufnahme gespeichert.', 5000); toggleRec(); }
+  }));
   rec.mime = pickMime();
   rec.id = uid();
   rec.idx = 0;
@@ -154,7 +164,9 @@ async function startRecording() {
 function newRecorder() {
   const idx = rec.idx;
   const offset = elapsed();
-  const r = new MediaRecorder(rec.stream, rec.mime ? { mimeType: rec.mime, audioBitsPerSecond: 32000 } : undefined);
+  let r;
+  try { r = new MediaRecorder(rec.stream, rec.mime ? { mimeType: rec.mime, audioBitsPerSecond: 32000 } : undefined); }
+  catch { r = new MediaRecorder(rec.stream); }
   const parts = [];
   r.ondataavailable = (e) => e.data && e.data.size && parts.push(e.data);
   r.onstop = () => {
@@ -200,11 +212,15 @@ async function stopRecording() {
   clearInterval(rec.tick);
   const r = rec.recorder;
   rec.recorder = null;
-  const done = new Promise((res) => r.addEventListener('stop', res, { once: true }));
-  if (r.state !== 'inactive') r.stop();
+  // Nie ewig auf das Stopp-Ereignis warten: war der Recorder schon aus, kommt es nicht mehr
+  const done = r.state === 'inactive' ? Promise.resolve() : new Promise((res) => {
+    r.addEventListener('stop', res, { once: true });
+    setTimeout(res, 4000);
+  });
+  try { if (r.state !== 'inactive') r.stop(); } catch {}
   await done;
   stopLive();
-  rec.stream.getTracks().forEach((t) => t.stop());
+  rec.stream.getTracks().forEach((t) => { t.onended = null; t.stop(); });
   stopMeter();
   try { await rec.wake?.release(); } catch {}
   rec.wake = null;
@@ -234,6 +250,7 @@ function updateTimer() { $('#timer').textContent = fmtTime(elapsed()); }
 function startMeter() {
   try {
     rec.audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    rec.audioCtx.resume?.().catch(() => {});
     const src = rec.audioCtx.createMediaStreamSource(rec.stream);
     rec.analyser = rec.audioCtx.createAnalyser();
     rec.analyser.fftSize = 512;
@@ -607,12 +624,38 @@ function fillSettings() {
 }
 
 // ---------- Ereignisse ----------
-$('#btnRec').onclick = () => (isRecording() ? stopRecording() : startRecording());
-$('#btnStop').onclick = () => stopRecording();
-$('#btnPause').onclick = () => togglePause();
+// Ein Tipp nach dem anderen: Doppeltipps während Start oder Stopp werden ignoriert
+let recBusy = false;
+async function toggleRec(forceStop = false) {
+  if (recBusy) return;
+  recBusy = true;
+  try {
+    if (isRecording()) await stopRecording();
+    else if (!forceStop) await startRecording();
+  } catch (e) {
+    toast('Aufnahme-Fehler: ' + (e.message || e), 6000);
+    try { rec.stream?.getTracks().forEach((t) => t.stop()); } catch {}
+    clearInterval(rec.rotateTimer);
+    clearInterval(rec.tick);
+    stopLive();
+    stopMeter();
+    rec.recorder = null;
+    rec.startedAt = 0;
+    setRecUi('off');
+  } finally {
+    recBusy = false;
+  }
+}
+$('#btnRec').onclick = () => toggleRec();
+$('#btnStop').onclick = () => toggleRec(true);
+$('#btnPause').onclick = () => { try { togglePause(); } catch (e) { toast('Pause nicht möglich: ' + e.message, 5000); } };
+window.addEventListener('error', (e) => toast('Fehler: ' + e.message, 6000));
+window.addEventListener('unhandledrejection', (e) => toast('Fehler: ' + (e.reason?.message || e.reason), 6000));
 $('#btnSettings').onclick = () => (location.hash = '#/settings');
 $('#btnBack').onclick = () => (location.hash = '#/');
-$('#optLive').checked = settings.live || (!settings.groq && !!SR);
+// Live-Mitschrift standardmäßig aus: auf vielen Handys streitet sie mit der Aufnahme ums Mikrofon
+$('#optLive').checked = !!settings.live && !!SR;
+$('#optLive').closest('label').hidden = !SR;
 $('#optLive').onchange = (e) => { settings.live = e.target.checked; saveSettings(); };
 $('#search').oninput = () => renderList();
 $('#list').onclick = (e) => { const li = e.target.closest('li'); if (li) location.hash = '#/r/' + li.dataset.id; };
