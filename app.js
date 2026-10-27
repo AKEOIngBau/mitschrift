@@ -109,7 +109,7 @@ async function updateRec(id, patch) {
 const rec = {
   stream: null, recorder: null, id: null, mime: '', idx: 0, chunkStart: 0,
   startedAt: 0, pausedTotal: 0, pausedAt: 0, rotateTimer: null, tick: null,
-  audioCtx: null, analyser: null, wake: null, speech: null, liveFinal: '', liveInterim: '', saving: Promise.resolve(),
+  audioCtx: null, analyser: null, wake: null, lostAt: 0, speech: null, liveFinal: '', liveInterim: '', saving: Promise.resolve(),
 };
 function pickMime() {
   const opts = ['audio/webm;codecs=opus', 'audio/mp4', 'audio/webm', 'audio/ogg;codecs=opus'];
@@ -135,10 +135,7 @@ async function startRecording() {
     toast('Kein Mikrofonzugriff (' + (e.name || e.message) + '). Bitte in den Einstellungen des Handys erlauben.', 6000);
     return;
   }
-  // Beendet das System das Mikrofon (Anruf, andere App), sauber abschließen statt hängen zu bleiben
-  rec.stream.getAudioTracks().forEach((t) => (t.onended = () => {
-    if (isRecording()) { toast('Das Mikrofon wurde vom Handy beendet. Aufnahme gespeichert.', 5000); toggleRec(); }
-  }));
+  watchTracks();
   rec.mime = pickMime();
   rec.id = uid();
   rec.idx = 0;
@@ -156,9 +153,84 @@ async function startRecording() {
   rec.tick = setInterval(updateTimer, 500);
   startMeter();
   if ($('#optLive').checked) startLive();
-  try { rec.wake = await navigator.wakeLock?.request('screen'); } catch {}
+  keepAwake();
   try { navigator.storage?.persist?.(); } catch {}
   setRecUi('on');
+}
+
+// ---------- Wach bleiben und weiter aufnehmen ----------
+// Bildschirm anlassen: Wake Lock, und falls das Handy es nicht kann oder verweigert, ein stummes Video in Dauerschleife
+const wakeVideo = Object.assign(document.createElement('video'), { src: 'wach.mp4', loop: true, muted: true, playsInline: true });
+wakeVideo.setAttribute('playsinline', '');
+wakeVideo.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none';
+document.body.appendChild(wakeVideo);
+async function keepAwake() {
+  if (!isRecording() && !rec.stream) return;
+  if (!rec.wake) {
+    try {
+      rec.wake = await navigator.wakeLock.request('screen');
+      rec.wake.addEventListener('release', () => { rec.wake = null; });
+    } catch { rec.wake = null; }
+  }
+  if (!rec.wake) wakeVideo.play().catch(() => {});
+}
+async function releaseAwake() {
+  try { await rec.wake?.release(); } catch {}
+  rec.wake = null;
+  wakeVideo.pause();
+}
+
+// Nimmt das Handy das Mikrofon weg (Sperrbildschirm, Anruf, andere App), friert die Uhr ein
+// und verbindet sich wieder, sobald die App zurück ist. Die Aufnahme läuft im selben Gespräch weiter.
+function watchTracks() {
+  rec.stream.getAudioTracks().forEach((t) => {
+    t.onended = () => micLost();
+    t.onmute = () => { if (document.visibilityState === 'hidden') micLost(); };
+    t.onunmute = () => { if (rec.lostAt && t.readyState === 'live') micBack(false); };
+  });
+}
+function micLost() {
+  if (!isRecording() || rec.lostAt) return;
+  rec.lostAt = Date.now();
+  if (!rec.pausedAt) rec.pausedAt = rec.lostAt;
+  if (document.visibilityState === 'visible') reconnectMic();
+}
+function micBack(newStream) {
+  const gap = Math.round((Date.now() - rec.lostAt) / 1000);
+  if (rec.pausedAt === rec.lostAt) { rec.pausedTotal += Date.now() - rec.pausedAt; rec.pausedAt = 0; }
+  rec.lostAt = 0;
+  if (gap >= 3) toast(`Aufnahme läuft weiter. Das Handy hatte das Mikrofon ${fmtTime(gap)} gesperrt.`, 5000);
+  if (newStream) { stopMeter(); startMeter(); }
+}
+let reconnecting = false;
+async function reconnectMic() {
+  if (reconnecting || !isRecording()) return;
+  reconnecting = true;
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const old = rec.recorder;
+    const oldStream = rec.stream;
+    old.endAt = elapsed();
+    try { if (old.state !== 'inactive') old.stop(); } catch {}
+    oldStream.getTracks().forEach((t) => { t.onended = t.onmute = t.onunmute = null; t.stop(); });
+    rec.stream = s;
+    watchTracks();
+    rec.idx++;
+    micBack(true);
+    newRecorder();
+    if (rec.pausedAt) rec.recorder.pause();
+  } catch (e) {
+    toast('Mikrofon nicht mehr verfügbar. Aufnahme bis hierhin gespeichert.', 6000);
+    rec.lostAt = 0;
+    toggleRec(true);
+  } finally {
+    reconnecting = false;
+  }
+}
+function micBroken() {
+  if (!isRecording()) return false;
+  const tracks = rec.stream?.getAudioTracks() || [];
+  return !!rec.lostAt || rec.recorder.state === 'inactive' || tracks.some((t) => t.readyState === 'ended');
 }
 
 function newRecorder() {
@@ -169,9 +241,10 @@ function newRecorder() {
   catch { r = new MediaRecorder(rec.stream); }
   const parts = [];
   r.ondataavailable = (e) => e.data && e.data.size && parts.push(e.data);
+  r.onerror = () => { if (rec.recorder === r) micLost(); };
   r.onstop = () => {
     const blob = new Blob(parts, { type: r.mimeType || rec.mime || 'audio/webm' });
-    const dur = elapsed() - offset;
+    const dur = (r.endAt ?? elapsed()) - offset;
     const id = rec.id;
     rec.saving = rec.saving.then(async () => {
       await putAudio(id, idx, blob);
@@ -208,6 +281,7 @@ function togglePause() {
 async function stopRecording() {
   if (!rec.recorder) return;
   if (rec.pausedAt) { rec.pausedTotal += Date.now() - rec.pausedAt; rec.pausedAt = 0; }
+  rec.lostAt = 0;
   clearInterval(rec.rotateTimer);
   clearInterval(rec.tick);
   const r = rec.recorder;
@@ -222,8 +296,7 @@ async function stopRecording() {
   stopLive();
   rec.stream.getTracks().forEach((t) => { t.onended = null; t.stop(); });
   stopMeter();
-  try { await rec.wake?.release(); } catch {}
-  rec.wake = null;
+  await releaseAwake();
   await rec.saving;
   const id = rec.id;
   const live = (rec.liveFinal + ' ' + rec.liveInterim).trim();
@@ -238,13 +311,30 @@ function setRecUi(state) {
   $('#btnRec').setAttribute('aria-label', state === 'off' ? 'Aufnahme starten' : 'Aufnahme beenden');
   $('#btnPause').hidden = state === 'off';
   $('#btnStop').hidden = state === 'off';
+  $('#btnDark').hidden = state === 'off';
+  if (state === 'off') setDark(false);
   $('#btnPause').textContent = state === 'paused' ? 'Weiter' : 'Pause';
-  $('#recHint').textContent = state === 'off' ? 'Tippen zum Aufnehmen' : state === 'paused' ? 'Pausiert' : 'Aufnahme läuft. Bildschirm bleibt an.';
+  $('#recHint').textContent = state === 'off' ? 'Tippen zum Aufnehmen' : state === 'paused' ? 'Pausiert' : 'Aufnahme läuft. Bildschirm bleibt an, nicht die Seitentaste drücken.';
   $('#liveText').hidden = !(state !== 'off' && $('#optLive').checked);
   $('#optLive').disabled = state !== 'off';
   if (state === 'off') $('#timer').textContent = '00:00';
 }
-function updateTimer() { $('#timer').textContent = fmtTime(elapsed()); }
+function updateTimer() {
+  const t = fmtTime(elapsed());
+  $('#timer').textContent = t;
+  if (!$('#dark').hidden) $('#darkTimer').textContent = t;
+}
+// Taschenmodus: Bildschirm bleibt an, zeigt aber nur Schwarz. Spart Akku und verhindert versehentliches Tippen.
+function setDark(on) {
+  $('#dark').hidden = !on;
+  if (on) $('#darkTimer').textContent = fmtTime(elapsed());
+}
+let darkTap = 0;
+$('#dark').addEventListener('click', () => {
+  if (Date.now() - darkTap < 400) setDark(false);
+  darkTap = Date.now();
+});
+$('#btnDark').onclick = () => setDark(true);
 
 // Pegelanzeige
 function startMeter() {
@@ -255,11 +345,12 @@ function startMeter() {
     rec.analyser = rec.audioCtx.createAnalyser();
     rec.analyser.fftSize = 512;
     src.connect(rec.analyser);
+    const mine = rec.analyser;
     const c = $('#level'), g = c.getContext('2d');
     const data = new Uint8Array(rec.analyser.fftSize);
     const hist = new Array(100).fill(0);
     const draw = () => {
-      if (!rec.analyser) { g.clearRect(0, 0, c.width, c.height); return; }
+      if (rec.analyser !== mine) { if (!rec.analyser) g.clearRect(0, 0, c.width, c.height); return; }
       rec.analyser.getByteTimeDomainData(data);
       let peak = 0;
       for (const v of data) peak = Math.max(peak, Math.abs(v - 128));
@@ -642,6 +733,7 @@ async function toggleRec(forceStop = false) {
     clearInterval(rec.tick);
     stopLive();
     stopMeter();
+    releaseAwake();
     rec.recorder = null;
     rec.startedAt = 0;
     setRecUi('off');
@@ -743,9 +835,9 @@ $('#dStatus').onclick = () => { if (current?.error && /Schlüssel|Einstellungen/
 window.addEventListener('hashchange', route);
 window.addEventListener('beforeunload', (e) => { if (isRecording()) { e.preventDefault(); e.returnValue = ''; } });
 document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState === 'visible' && isRecording() && !rec.wake) {
-    try { rec.wake = await navigator.wakeLock?.request('screen'); } catch {}
-  }
+  if (document.visibilityState !== 'visible' || !isRecording()) return;
+  keepAwake();
+  if (micBroken()) { if (rec.lostAt) reconnectMic(); else micLost(); }
 });
 
 // Unterbrochene Aufnahmen und offene Verarbeitungen wieder aufnehmen

@@ -34,6 +34,7 @@
         <button class="ctl" id="btnStop" hidden>Fertig</button>
       </div>
       <div class="hint" id="recHint">Tippen zum Aufnehmen</div>
+      <button class="ctl dark-btn" id="btnDark" hidden>Taschenmodus (Bildschirm schwarz)</button>
       <label class="toggle"><input type="checkbox" id="optLive"> Live-Mitschrift während der Aufnahme</label>
       <div class="live" id="liveText" hidden></div>
     </div>
@@ -117,6 +118,11 @@
   </section>
 </main>
 
+<div class="dark" id="dark" hidden>
+  <div class="dark-dot"></div>
+  <div id="darkTimer">00:00</div>
+  <div>Aufnahme läuft. Doppelt tippen zum Zurückkehren.</div>
+</div>
 <div class="toast" id="toast" hidden></div>
 <script src="app.js"></script>
 </body>
