@@ -58,6 +58,32 @@ function loadSettings() {
 let settings = loadSettings();
 function saveSettings() {
   try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch {}
+  // Zweite Kopie in der Datenbank, falls das Handy den kleinen Speicher leert
+  tx('audio', 'readwrite', (s) => s.put({ key: '__settings', settings })).catch(() => {});
+}
+async function restoreSettings() {
+  if (settings.groq || settings.claude) return;
+  try {
+    const copy = (await tx('audio', 'readonly', (s) => s.get('__settings')))?.settings;
+    if (copy && (copy.groq || copy.claude)) { settings = { ...defaults, ...copy }; saveSettings(); }
+  } catch {}
+}
+// Sicherungslink: enthält die Schlüssel im Teil hinter #, der nie an einen Server geht
+function setupLink() {
+  const data = btoa(unescape(encodeURIComponent(JSON.stringify({ groq: settings.groq, claude: settings.claude }))));
+  return location.origin + location.pathname + '#setup=' + data;
+}
+function importSetupLink(text = location.hash) {
+  const m = text.match(/#setup=([A-Za-z0-9+/=]+)/);
+  if (!m) return false;
+  try {
+    const d = JSON.parse(decodeURIComponent(escape(atob(m[1]))));
+    settings = { ...settings, groq: d.groq || settings.groq, claude: d.claude || settings.claude };
+    saveSettings();
+    toast('Schlüssel aus dem Sicherungslink übernommen.', 4000);
+  } catch { toast('Der Sicherungslink ist beschädigt.', 5000); }
+  if (location.hash.startsWith('#setup=')) history.replaceState(null, '', location.pathname + '#/settings');
+  return true;
 }
 
 // ---------- Speicher (IndexedDB) ----------
@@ -789,11 +815,16 @@ $('#aDelete').onclick = async () => {
   toast('Gelöscht.');
 };
 // Einstellungen speichern sich bei jeder Eingabe selbst, der Knopf prüft zusätzlich den Schlüssel
-function readSettingsForm() {
+function readSettingsForm(e) {
+  // Sicherungslink in ein Schlüsselfeld eingefügt: beide Schlüssel übernehmen
+  const pasted = [$('#sGroq').value, $('#sClaude').value].find((v) => v.includes('#setup='));
+  if (pasted && importSetupLink(pasted)) { fillSettings(); updateKeyState(); resumePending(); return; }
   const hadKey = !!(settings.groq || settings.claude);
+  // Ein Schlüssel wird nur leer, wenn man ihn selbst löscht, nie durch Autofill in einem anderen Feld
+  const key = (sel, old) => { const v = $(sel).value.trim(); return v || (e?.target !== $(sel) ? old : ''); };
   settings = {
     ...settings,
-    groq: $('#sGroq').value.trim(), claude: $('#sClaude').value.trim(), lang: $('#sLang').value,
+    groq: key('#sGroq', settings.groq), claude: key('#sClaude', settings.claude), lang: $('#sLang').value,
     claudeModel: $('#sClaudeModel').value.trim() || defaults.claudeModel,
     groqModel: $('#sGroqModel').value.trim() || defaults.groqModel, prompt: $('#sPrompt').value.trim(),
   };
@@ -830,6 +861,12 @@ $('#sSave').onclick = async () => {
   else if (res === 'missing' && settings.claude) toast('Gespeichert. Für die Transkription fehlt noch der Groq-Schlüssel.', 4000);
 };
 $('#keyBanner').onclick = () => (location.hash = '#/settings');
+$('#sBackup').onclick = async () => {
+  if (!settings.groq && !settings.claude) { toast('Erst Schlüssel eintragen.'); return; }
+  const url = setupLink();
+  try { await navigator.clipboard.writeText(url); toast('Sicherungslink kopiert. In einer gesperrten Notiz oder im Passwort-Manager ablegen.', 6000); }
+  catch { prompt('Sicherungslink kopieren:', url); }
+};
 $('#dStatus').onclick = () => { if (current?.error && /Schlüssel|Einstellungen/.test(current.error)) location.hash = '#/settings'; };
 
 window.addEventListener('hashchange', route);
@@ -849,5 +886,6 @@ async function resumePending() {
 }
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
-updateKeyState();
-route().then(resumePending);
+try { navigator.storage?.persist?.(); } catch {}
+importSetupLink();
+restoreSettings().then(() => { updateKeyState(); return route(); }).then(resumePending);

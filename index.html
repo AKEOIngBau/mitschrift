@@ -81,7 +81,7 @@
   <section id="viewSettings" class="view" hidden>
     <h2>Transkription</h2>
     <label>Groq API-Schlüssel (Whisper, kostenloser Einstieg)
-      <input id="sGroq" type="password" autocomplete="off" placeholder="gsk_...">
+      <input id="sGroq" class="secret" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" placeholder="gsk_...">
     </label>
     <p class="small" id="sGroqState"></p>
     <p class="small">Schlüssel holen: <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>. Ohne Schlüssel nutzt die App nur die Live-Mitschrift des Browsers.</p>
@@ -96,7 +96,7 @@
 
     <h2>Zusammenfassung</h2>
     <label>Anthropic API-Schlüssel (Claude, optional)
-      <input id="sClaude" type="password" autocomplete="off" placeholder="sk-ant-...">
+      <input id="sClaude" class="secret" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" data-1p-ignore data-lpignore="true" placeholder="sk-ant-...">
     </label>
     <p class="small">Ist ein Claude-Schlüssel hinterlegt, fasst Claude zusammen. Sonst übernimmt das Groq mit demselben Schlüssel wie oben. Schlüssel holen: <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">console.anthropic.com</a>.</p>
     <label>Claude-Modell
@@ -110,6 +110,10 @@
     </label>
     <button id="sSave" class="primary">Speichern und prüfen</button>
     <p class="small">Alles wird beim Tippen automatisch gespeichert. iPhone: Den Schlüssel in der App vom Startbildschirm eintragen, nicht in Safari, denn beide haben getrennte Speicher.</p>
+
+    <h2>Sicherung</h2>
+    <button id="sBackup" class="ctl">Sicherungslink kopieren</button>
+    <p class="small">Der Link enthält deine Schlüssel. Leg ihn in einer gesperrten Notiz oder im Passwort-Manager ab und teile ihn mit niemandem. Sind die Schlüssel einmal weg, fügst du den Link einfach oben ins Groq-Feld ein, und beide Schlüssel sind wieder da.</p>
 
     <h2>Daten</h2>
     <p class="small">Alle Aufnahmen bleiben auf diesem Handy (im Browser-Speicher). Zum Transkribieren geht das Audio an Groq, zum Zusammenfassen der Text an Claude oder Groq. Die Schlüssel liegen nur auf diesem Gerät.</p>

@@ -113,3 +113,5 @@ audio { width: 100%; margin-bottom: 10px; }
 #darkTimer { font-size: 28px; font-variant-numeric: tabular-nums; }
 .dark-dot { width: 10px; height: 10px; border-radius: 50%; background: #5a1a1b; animation: blink 2s infinite; }
 @keyframes blink { 50% { opacity: .3; } }
+.secret { -webkit-text-security: disc; }
+#sBackup { margin-top: 4px; }
