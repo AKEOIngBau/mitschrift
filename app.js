@@ -498,6 +498,10 @@ function extFor(type) {
   if (/mpeg|mp3/.test(type)) return 'mp3';
   return 'webm';
 }
+const KEY_ERR = {
+  groq: 'Groq lehnt den Schlüssel ab. Hier tippen und ihn in den Einstellungen neu eintragen.',
+  claude: 'Anthropic lehnt den Claude-Schlüssel ab. Hier tippen und ihn in den Einstellungen neu eintragen.',
+};
 async function groqTranscribe(blob, type) {
   const fd = new FormData();
   fd.append('file', blob, 'audio.' + extFor(type || blob.type));
@@ -510,6 +514,7 @@ async function groqTranscribe(blob, type) {
       method: 'POST', headers: { Authorization: 'Bearer ' + settings.groq }, body: fd,
     });
     if (r.status === 429 && attempt < 4) { await new Promise((ok) => setTimeout(ok, 15000 * (attempt + 1))); continue; }
+    if (r.status === 401) throw new Error(KEY_ERR.groq);
     if (!r.ok) throw new Error('Transkription fehlgeschlagen (' + r.status + '): ' + (await r.text()).slice(0, 200));
     return r.json();
   }
@@ -526,7 +531,12 @@ async function llm(system, user, maxTokens = 4000) {
       },
       body: JSON.stringify({ model: settings.claudeModel || defaults.claudeModel, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] }),
     });
-    if (!r.ok) throw new Error('Claude-Fehler (' + r.status + '): ' + (await r.text()).slice(0, 200));
+    if (r.status === 401) throw new Error(KEY_ERR.claude);
+    if (!r.ok) {
+      const t = await r.text();
+      if (/credit balance/i.test(t)) throw new Error('Das Anthropic-Guthaben ist leer. Bitte in der Anthropic-Konsole aufladen oder den Claude-Schlüssel in den Einstellungen löschen, dann fasst Groq zusammen.');
+      throw new Error('Claude-Fehler (' + r.status + '): ' + t.slice(0, 200));
+    }
     const j = await r.json();
     return j.content.filter((c) => c.type === 'text').map((c) => c.text).join('');
   }
@@ -536,6 +546,7 @@ async function llm(system, user, maxTokens = 4000) {
       headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + settings.groq },
       body: JSON.stringify({ model: settings.groqModel || defaults.groqModel, max_tokens: maxTokens, temperature: 0.2, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }),
     });
+    if (r.status === 401) throw new Error(KEY_ERR.groq);
     if (!r.ok) throw new Error('Groq-Fehler (' + r.status + '): ' + (await r.text()).slice(0, 200));
     return (await r.json()).choices[0].message.content;
   }
