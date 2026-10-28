@@ -499,8 +499,8 @@ function extFor(type) {
   return 'webm';
 }
 const KEY_ERR = {
-  groq: 'Groq lehnt den Schlüssel ab. Hier tippen und ihn in den Einstellungen neu eintragen.',
-  claude: 'Anthropic lehnt den Claude-Schlüssel ab. Hier tippen und ihn in den Einstellungen neu eintragen.',
+  get groq() { return 'Groq lehnt den Schlüssel' + keyEnd(settings.groq) + ' ab. Hier tippen und ihn in den Einstellungen neu eintragen.'; },
+  get claude() { return 'Anthropic lehnt den Claude-Schlüssel' + keyEnd(settings.claude) + ' ab. Hier tippen und ihn in den Einstellungen neu eintragen.'; },
 };
 async function groqTranscribe(blob, type) {
   const fd = new FormData();
@@ -852,13 +852,16 @@ async function checkGroqKey() {
     return r.ok ? 'ok' : 'bad';
   } catch { return 'offline'; }
 }
+// Nur die letzten vier Zeichen zeigen, damit man den Schlüssel mit der Anbieter-Konsole vergleichen kann
+const keyEnd = (k) => (k ? ' (endet auf ' + k.slice(-4) + ')' : '');
 function updateKeyState(check) {
   const el = $('#sGroqState');
   const has = !!(settings.groq || settings.claude);
   $('#keyBanner').hidden = !!settings.groq;
   if (!settings.groq) { el.textContent = 'Kein Groq-Schlüssel gespeichert.'; el.className = 'small bad'; }
-  else if (!check) { el.textContent = 'Groq-Schlüssel gespeichert.'; el.className = 'small good'; }
-  else el.textContent = { ok: '✓ Groq-Schlüssel funktioniert.', bad: '✗ Groq lehnt diesen Schlüssel ab. Bitte neu kopieren.', offline: 'Keine Verbindung, Schlüssel konnte nicht geprüft werden.' }[check] || '';
+  else if (!check) { el.textContent = 'Groq-Schlüssel gespeichert' + keyEnd(settings.groq) + '.'; el.className = 'small good'; }
+  else el.textContent = { ok: '✓ Groq-Schlüssel funktioniert' + keyEnd(settings.groq) + '.', bad: '✗ Groq lehnt diesen Schlüssel ab' + keyEnd(settings.groq) + '. Bitte neu kopieren.', offline: 'Keine Verbindung, Schlüssel konnte nicht geprüft werden.' }[check] || '';
+  $('#sClaudeState').textContent = settings.claude ? 'Claude-Schlüssel gespeichert' + keyEnd(settings.claude) + '.' : '';
   if (check) el.className = 'small ' + (check === 'ok' ? 'good' : 'bad');
   return has;
 }
