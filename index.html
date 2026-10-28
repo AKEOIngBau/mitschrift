@@ -113,6 +113,13 @@
 
     <h2>Sicherung</h2>
     <button id="sBackup" class="ctl">Sicherungslink kopieren</button>
+    <div id="sBackupBox" hidden>
+      <textarea id="sBackupText" rows="4" readonly autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></textarea>
+      <div class="backup-btns">
+        <button id="sBackupShare" class="ctl">Teilen (z. B. in Notizen sichern)</button>
+        <button id="sBackupHide" class="ctl">Ausblenden</button>
+      </div>
+    </div>
     <p class="small">Der Link enthält deine Schlüssel. Leg ihn in einer gesperrten Notiz oder im Passwort-Manager ab und teile ihn mit niemandem. Sind die Schlüssel einmal weg, fügst du den Link einfach oben ins Groq-Feld ein, und beide Schlüssel sind wieder da.</p>
 
     <h2>Daten</h2>

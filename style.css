@@ -115,3 +115,5 @@ audio { width: 100%; margin-bottom: 10px; }
 @keyframes blink { 50% { opacity: .3; } }
 .secret { -webkit-text-security: disc; }
 #sBackup { margin-top: 4px; }
+#sBackupText { font-size: 13px; word-break: break-all; }
+.backup-btns { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }

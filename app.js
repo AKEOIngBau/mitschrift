@@ -643,6 +643,7 @@ async function route() {
   } else if (h === '#/settings') {
     current = null;
     show('Settings');
+    $('#sBackupText').value = ''; $('#sBackupBox').hidden = true;
     fillSettings();
   } else {
     current = null;
@@ -864,9 +865,22 @@ $('#keyBanner').onclick = () => (location.hash = '#/settings');
 $('#sBackup').onclick = async () => {
   if (!settings.groq && !settings.claude) { toast('Erst Schlüssel eintragen.'); return; }
   const url = setupLink();
-  try { await navigator.clipboard.writeText(url); toast('Sicherungslink kopiert. In einer gesperrten Notiz oder im Passwort-Manager ablegen.', 6000); }
-  catch { prompt('Sicherungslink kopieren:', url); }
+  // Link immer sichtbar zeigen, denn manche Handys blockieren das Kopieren still
+  const box = $('#sBackupText');
+  box.value = url;
+  $('#sBackupBox').hidden = false;
+  $('#sBackupShare').hidden = !navigator.share;
+  box.focus(); box.select(); box.setSelectionRange(0, url.length);
+  let ok = false;
+  try { await navigator.clipboard.writeText(url); ok = true; } catch {}
+  if (!ok) { try { ok = document.execCommand('copy'); } catch {} }
+  toast(ok ? 'Sicherungslink kopiert. In einer gesperrten Notiz oder im Passwort-Manager ablegen.'
+           : 'Kopieren blockiert. ' + (navigator.share ? 'Tippe auf „Teilen“ oder halte' : 'Halte') + ' den Link gedrückt und wähle Kopieren.', 6000);
 };
+$('#sBackupShare').onclick = async () => {
+  try { await navigator.share({ title: 'Mitschrift Sicherungslink', text: $('#sBackupText').value }); } catch {}
+};
+$('#sBackupHide').onclick = () => { $('#sBackupText').value = ''; $('#sBackupBox').hidden = true; };
 $('#dStatus').onclick = () => { if (current?.error && /Schlüssel|Einstellungen/.test(current.error)) location.hash = '#/settings'; };
 
 window.addEventListener('hashchange', route);
