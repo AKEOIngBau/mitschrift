@@ -4,6 +4,8 @@
 const $ = (s) => document.querySelector(s);
 const CHUNK_MS = 5 * 60 * 1000; // alle 5 Minuten eine neue Audiodatei, damit nichts zu groß wird
 const MAX_UPLOAD = 24 * 1024 * 1024;
+const PV = 2; // Stand der Verarbeitung; ältere Aufnahmen werden beim Öffnen einmal automatisch nachgearbeitet
+const MIC = { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true } }; // Filter wie im Telefonat schlucken leise und entfernte Stimmen
 
 function toast(msg, ms = 2500) {
   const t = $('#toast');
@@ -117,9 +119,11 @@ const putRec = (rec) => tx('recs', 'readwrite', (s) => s.put(rec));
 const allRecs = () => tx('recs', 'readonly', (s) => s.getAll());
 const putAudio = (id, idx, blob) => tx('audio', 'readwrite', (s) => s.put({ key: `${id}:${idx}`, blob }));
 const getAudio = async (id, idx) => (await tx('audio', 'readonly', (s) => s.get(`${id}:${idx}`)))?.blob;
+const audioRange = (id) => IDBKeyRange.bound(`${id}:`, `${id}:\uffff`);
+const chunkIdx = (c, i) => c.idx ?? i; // ältere Aufnahmen kennen nur die Reihenfolge
 async function deleteRec(rec) {
   await tx('recs', 'readwrite', (s) => s.delete(rec.id));
-  for (let i = 0; i < rec.chunks.length; i++) await tx('audio', 'readwrite', (s) => s.delete(`${rec.id}:${i}`));
+  await tx('audio', 'readwrite', (s) => s.delete(audioRange(rec.id)));
 }
 async function updateRec(id, patch) {
   const rec = await getRec(id);
@@ -155,7 +159,7 @@ async function startRecording() {
   }
   $('#recHint').textContent = 'Mikrofon wird gestartet …';
   try {
-    rec.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    rec.stream = await navigator.mediaDevices.getUserMedia(MIC);
   } catch (e) {
     $('#recHint').textContent = 'Tippen zum Aufnehmen';
     toast('Kein Mikrofonzugriff (' + (e.name || e.message) + '). Bitte in den Einstellungen des Handys erlauben.', 6000);
@@ -172,7 +176,7 @@ async function startRecording() {
   rec.pausedAt = 0;
   await putRec({
     id: rec.id, title: 'Gespräch vom ' + new Date().toLocaleDateString('de-DE'), created: Date.now(),
-    duration: 0, mime: rec.mime, chunks: [], status: 'recording', transcript: null, liveText: '', summary: '', qa: [],
+    duration: 0, mime: rec.mime, chunks: [], status: 'recording', pv: PV, parts: {}, transcript: null, liveText: '', summary: '', qa: [],
   });
   newRecorder();
   rec.rotateTimer = setInterval(rotate, CHUNK_MS);
@@ -233,7 +237,7 @@ async function reconnectMic() {
   if (reconnecting || !isRecording()) return;
   reconnecting = true;
   try {
-    const s = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+    const s = await navigator.mediaDevices.getUserMedia(MIC);
     const old = rec.recorder;
     const oldStream = rec.stream;
     old.endAt = elapsed();
@@ -263,7 +267,7 @@ function newRecorder() {
   const idx = rec.idx;
   const offset = elapsed();
   let r;
-  try { r = new MediaRecorder(rec.stream, rec.mime ? { mimeType: rec.mime, audioBitsPerSecond: 32000 } : undefined); }
+  try { r = new MediaRecorder(rec.stream, rec.mime ? { mimeType: rec.mime, audioBitsPerSecond: 64000 } : undefined); }
   catch { r = new MediaRecorder(rec.stream); }
   const parts = [];
   r.ondataavailable = (e) => e.data && e.data.size && parts.push(e.data);
@@ -274,10 +278,14 @@ function newRecorder() {
     const id = rec.id;
     rec.saving = rec.saving.then(async () => {
       await putAudio(id, idx, blob);
-      await updateRec(id, (x) => ({ chunks: [...x.chunks, { offset, dur, size: blob.size, type: blob.type }], duration: offset + dur }));
+      const x = await updateRec(id, (x) => ({
+        chunks: [...x.chunks.filter((c, i) => chunkIdx(c, i) !== idx), { idx, offset, dur, size: blob.size, type: blob.type }].sort((a, b) => a.offset - b.offset),
+        duration: Math.max(x.duration || 0, offset + dur),
+      }));
+      if (x.status !== 'recording') processRec(id); // kam erst nach dem Stopp an: nachholen
     });
   };
-  r.start(10000); // alle 10 s Daten einsammeln
+  r.start(); // ohne Zeitscheiben: Safari baut daraus sonst Dateien, die nur teilweise lesbar sein können
   rec.recorder = r;
 }
 function rotate() {
@@ -315,7 +323,7 @@ async function stopRecording() {
   // Nie ewig auf das Stopp-Ereignis warten: war der Recorder schon aus, kommt es nicht mehr
   const done = r.state === 'inactive' ? Promise.resolve() : new Promise((res) => {
     r.addEventListener('stop', res, { once: true });
-    setTimeout(res, 4000);
+    setTimeout(res, 15000);
   });
   try { if (r.state !== 'inactive') r.stop(); } catch {}
   await done;
@@ -330,7 +338,7 @@ async function stopRecording() {
   setRecUi('off');
   await updateRec(id, { status: 'pending', liveText: live });
   location.hash = '#/r/' + id;
-  processRec(id);
+  processRec(id).then(resumePending);
 }
 function setRecUi(state) {
   $('#btnRec').classList.toggle('on', state !== 'off');
@@ -434,7 +442,7 @@ function stopLive() {
 // ---------- Import ----------
 async function importFile(file) {
   const id = uid();
-  const base = { id, title: file.name.replace(/\.[^.]+$/, ''), created: file.lastModified || Date.now(), duration: 0, mime: file.type, chunks: [], status: 'pending', transcript: null, liveText: '', summary: '', qa: [] };
+  const base = { id, title: file.name.replace(/\.[^.]+$/, ''), created: file.lastModified || Date.now(), duration: 0, mime: file.type, chunks: [], status: 'pending', pv: PV, parts: {}, transcript: null, liveText: '', summary: '', qa: [] };
   toast('Datei wird eingelesen …');
   let pieces;
   if (file.size <= MAX_UPLOAD) {
@@ -446,7 +454,7 @@ async function importFile(file) {
   let offset = 0;
   for (let i = 0; i < pieces.length; i++) {
     await putAudio(id, i, pieces[i].blob);
-    base.chunks.push({ offset, dur: pieces[i].dur, size: pieces[i].blob.size, type: pieces[i].blob.type || file.type });
+    base.chunks.push({ idx: i, offset, dur: pieces[i].dur, size: pieces[i].blob.size, type: pieces[i].blob.type || file.type });
     offset += pieces[i].dur;
   }
   base.duration = offset;
@@ -463,34 +471,45 @@ function probeDuration(blob) {
     a.src = URL.createObjectURL(blob);
   });
 }
+const RATE = 16000;
+async function decodeMono(file) {
+  const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: RATE });
+  try {
+    const buf = await ctx.decodeAudioData(await file.arrayBuffer());
+    const ch0 = buf.getChannelData(0);
+    if (buf.numberOfChannels < 2) return ch0;
+    const ch1 = buf.getChannelData(1);
+    return ch0.map((v, i) => (v + ch1[i]) / 2);
+  } finally { ctx.close(); }
+}
+function pcmToWav(pcm) {
+  const n = pcm.length;
+  const view = new DataView(new ArrayBuffer(44 + n * 2));
+  const w = (o, s) => [...s].forEach((c, i) => view.setUint8(o + i, c.charCodeAt(0)));
+  w(0, 'RIFF'); view.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, RATE, true); view.setUint32(28, RATE * 2, true);
+  view.setUint16(32, 2, true); view.setUint16(34, 16, true); w(36, 'data'); view.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const v = Math.max(-1, Math.min(1, pcm[i]));
+    view.setInt16(44 + i * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+  }
+  return new Blob([view], { type: 'audio/wav' });
+}
 async function splitToWav(file) {
-  const rate = 16000;
-  const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: rate });
-  const buf = await ctx.decodeAudioData(await file.arrayBuffer());
-  ctx.close();
-  const ch0 = buf.getChannelData(0), ch1 = buf.numberOfChannels > 1 ? buf.getChannelData(1) : null;
-  const per = 10 * 60 * buf.sampleRate;
+  const pcm = await decodeMono(file);
+  const per = 10 * 60 * RATE;
   const out = [];
-  for (let start = 0; start < buf.length; start += per) {
-    const n = Math.min(per, buf.length - start);
-    const view = new DataView(new ArrayBuffer(44 + n * 2));
-    const w = (o, s) => [...s].forEach((c, i) => view.setUint8(o + i, c.charCodeAt(0)));
-    w(0, 'RIFF'); view.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
-    view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
-    view.setUint32(24, buf.sampleRate, true); view.setUint32(28, buf.sampleRate * 2, true);
-    view.setUint16(32, 2, true); view.setUint16(34, 16, true); w(36, 'data'); view.setUint32(40, n * 2, true);
-    for (let i = 0; i < n; i++) {
-      let v = ch1 ? (ch0[start + i] + ch1[start + i]) / 2 : ch0[start + i];
-      v = Math.max(-1, Math.min(1, v));
-      view.setInt16(44 + i * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true);
-    }
-    out.push({ blob: new Blob([view], { type: 'audio/wav' }), dur: n / buf.sampleRate });
+  for (let start = 0; start < pcm.length; start += per) {
+    const part = pcm.subarray(start, start + per);
+    out.push({ blob: pcmToWav(part), dur: part.length / RATE });
   }
   return out;
 }
 
 // ---------- KI: Transkription + Zusammenfassung ----------
 const working = new Set();
+let RETRY_MS = 15000;
 function extFor(type) {
   if (/mp4|m4a|aac/.test(type)) return 'm4a';
   if (/wav/.test(type)) return 'wav';
@@ -502,26 +521,118 @@ const KEY_ERR = {
   get groq() { return 'Groq lehnt den Schlüssel' + keyEnd(settings.groq) + ' ab. Hier tippen und ihn in den Einstellungen neu eintragen.'; },
   get claude() { return 'Anthropic lehnt den Claude-Schlüssel' + keyEnd(settings.claude) + ' ab. Hier tippen und ihn in den Einstellungen neu eintragen.'; },
 };
-async function groqTranscribe(blob, type) {
+// Wiederholt bei Netzfehlern, Limits und Serverproblemen; hängt nie endlos, auch wenn das Handy die App schlafen legt
+async function fetchRetry(url, opts, tries = 5) {
+  for (let a = 1; ; a++) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), 240000);
+    let r = null;
+    try { r = await fetch(url, { ...opts, signal: ctl.signal }); } catch {} finally { clearTimeout(timer); }
+    if (r && r.status !== 429 && r.status < 500) return r;
+    if (a >= tries) {
+      if (r) return r;
+      throw new Error('Keine Verbindung. Die Verarbeitung geht beim nächsten Öffnen der App an dieser Stelle weiter.');
+    }
+    await new Promise((ok) => setTimeout(ok, RETRY_MS * a));
+  }
+}
+async function groqTranscribe(blob, type, temperature = 0) {
   const fd = new FormData();
   fd.append('file', blob, 'audio.' + extFor(type || blob.type));
   fd.append('model', 'whisper-large-v3');
   fd.append('response_format', 'verbose_json');
-  fd.append('temperature', '0');
+  fd.append('temperature', String(temperature));
   if (settings.lang) fd.append('language', settings.lang);
-  for (let attempt = 0; ; attempt++) {
-    const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-      method: 'POST', headers: { Authorization: 'Bearer ' + settings.groq }, body: fd,
-    });
-    if (r.status === 429 && attempt < 4) { await new Promise((ok) => setTimeout(ok, 15000 * (attempt + 1))); continue; }
-    if (r.status === 401) throw new Error(KEY_ERR.groq);
-    if (!r.ok) throw new Error('Transkription fehlgeschlagen (' + r.status + '): ' + (await r.text()).slice(0, 200));
-    return r.json();
-  }
+  const r = await fetchRetry('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST', headers: { Authorization: 'Bearer ' + settings.groq }, body: fd,
+  });
+  if (r.status === 401) throw new Error(KEY_ERR.groq);
+  if (r.status === 429) throw new Error('Das Groq-Limit ist gerade erreicht. Die Transkription geht beim nächsten Öffnen der App an dieser Stelle weiter.');
+  if (!r.ok) throw new Error('Transkription fehlgeschlagen (' + r.status + '): ' + (await r.text()).slice(0, 200));
+  return r.json();
 }
-async function llm(system, user, maxTokens = 4000) {
+const toSegs = (j, off, dur) => (j.segments?.length
+  ? j.segments.map((s) => ({ start: s.start + off, end: s.end + off, text: s.text }))
+  : j.text?.trim() ? [{ start: off, end: off + dur, text: j.text }] : []);
+
+// Lücken im Transkript, in denen das Audio nicht still ist, gezielt noch einmal transkribieren
+const GAP_MIN = 15;
+function findGaps(segs, dur) {
+  const gaps = [];
+  let pos = 0;
+  for (const s of [...segs].sort((a, b) => a.start - b.start)) {
+    if (s.start - pos >= GAP_MIN) gaps.push({ from: pos, to: s.start });
+    pos = Math.max(pos, s.end);
+  }
+  if (dur - pos >= GAP_MIN) gaps.push({ from: pos, to: dur });
+  return gaps;
+}
+function hasSound(pcm, gap) {
+  const win = RATE / 2;
+  let loud = 0, total = 0;
+  for (let i = Math.floor(gap.from * RATE); i + win <= Math.min(pcm.length, gap.to * RATE); i += win) {
+    let sum = 0;
+    for (let k = i; k < i + win; k++) sum += pcm[k] * pcm[k];
+    total++;
+    if (Math.sqrt(sum / win) > 0.008) loud++;
+  }
+  return total > 0 && loud / total >= 0.05;
+}
+async function transcribeChunk(c, blob) {
+  const j = await groqTranscribe(blob, c.type);
+  let segs = toSegs(j, 0, c.dur);
+  const warn = [];
+  const small = c.dur ? c.dur <= 1800 : blob.size <= 10 * 1024 * 1024; // längere Dateien passen nicht sicher in den Handy-Speicher
+  let pcm = null;
+  if (small) { try { pcm = await decodeMono(blob); } catch {} }
+  if (!pcm) {
+    const last = segs.reduce((m, s) => Math.max(m, s.end), 0);
+    if (c.dur - last >= 60) warn.push({ from: last, to: c.dur });
+    return { segs, warn };
+  }
+  const dur = pcm.length / RATE;
+  for (const gap of findGaps(segs, dur)) {
+    if (!hasSound(pcm, gap)) continue;
+    for (let from = Math.max(0, gap.from - 1); from < gap.to; from += 600) {
+      const to = Math.min(gap.to + 1, from + 600);
+      const sub = await groqTranscribe(pcmToWav(pcm.subarray(Math.floor(from * RATE), Math.floor(to * RATE))), 'audio/wav', 0.2);
+      segs = segs.concat(toSegs(sub, from, to - from));
+    }
+  }
+  for (const gap of findGaps(segs, dur)) if (hasSound(pcm, gap)) warn.push(gap); // auch beim zweiten Versuch nichts erkannt
+  return { segs: segs.sort((a, b) => a.start - b.start), warn };
+}
+function buildTranscript(r) {
+  const segments = [], gaps = [];
+  r.chunks.forEach((c, i) => {
+    const p = r.parts?.[chunkIdx(c, i)];
+    if (!p) return;
+    for (const s of p.segs) segments.push({ start: s.start + c.offset, end: s.end + c.offset, text: s.text });
+    for (const g of p.warn) gaps.push(g.missing ? g : { from: g.from + c.offset, to: g.to + c.offset });
+  });
+  segments.sort((a, b) => a.start - b.start);
+  return { segments, gaps };
+}
+// Audio, das gespeichert ist, aber in der Liste der Teile fehlt, wieder einhängen
+async function recoverChunks(r) {
+  const keys = await tx('audio', 'readonly', (s) => s.getAllKeys(audioRange(r.id)));
+  const chunks = r.chunks.map((c, i) => ({ ...c, idx: chunkIdx(c, i) }));
+  const known = new Set(chunks.map((c) => c.idx));
+  const lost = keys.map((k) => Number(String(k).split(':')[1])).filter((i) => !known.has(i)).sort((a, b) => a - b);
+  if (!lost.length) return r;
+  for (const idx of lost) {
+    const blob = await getAudio(r.id, idx);
+    const prev = chunks.filter((c) => c.idx < idx).sort((a, b) => b.idx - a.idx)[0];
+    chunks.push({ idx, offset: prev ? prev.offset + prev.dur : 0, dur: await probeDuration(blob), size: blob.size, type: blob.type });
+  }
+  chunks.sort((a, b) => a.offset - b.offset);
+  return updateRec(r.id, (x) => ({ chunks, duration: Math.max(x.duration || 0, ...chunks.map((c) => c.offset + c.dur)) }));
+}
+
+const CONTINUE = 'Deine Antwort wurde abgeschnitten. Schreib genau an dieser Stelle weiter, ohne Wiederholung und ohne Einleitung.';
+async function llmOnce(system, messages, maxTokens) {
   if (settings.claude) {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
+    const r = await fetchRetry('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -529,7 +640,7 @@ async function llm(system, user, maxTokens = 4000) {
         'anthropic-version': '2023-06-01',
         'anthropic-dangerous-direct-browser-access': 'true',
       },
-      body: JSON.stringify({ model: settings.claudeModel || defaults.claudeModel, max_tokens: maxTokens, system, messages: [{ role: 'user', content: user }] }),
+      body: JSON.stringify({ model: settings.claudeModel || defaults.claudeModel, max_tokens: maxTokens, system, messages }),
     });
     if (r.status === 401) throw new Error(KEY_ERR.claude);
     if (!r.ok) {
@@ -538,22 +649,35 @@ async function llm(system, user, maxTokens = 4000) {
       throw new Error('Claude-Fehler (' + r.status + '): ' + t.slice(0, 200));
     }
     const j = await r.json();
-    return j.content.filter((c) => c.type === 'text').map((c) => c.text).join('');
+    return { text: j.content.filter((c) => c.type === 'text').map((c) => c.text).join(''), cut: j.stop_reason === 'max_tokens' };
   }
   if (settings.groq) {
-    const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    const r = await fetchRetry('https://api.groq.com/openai/v1/chat/completions', {
       method: 'POST',
       headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + settings.groq },
-      body: JSON.stringify({ model: settings.groqModel || defaults.groqModel, max_tokens: maxTokens, temperature: 0.2, messages: [{ role: 'system', content: system }, { role: 'user', content: user }] }),
+      body: JSON.stringify({ model: settings.groqModel || defaults.groqModel, max_tokens: maxTokens, temperature: 0.2, messages: [{ role: 'system', content: system }, ...messages] }),
     });
     if (r.status === 401) throw new Error(KEY_ERR.groq);
     if (!r.ok) throw new Error('Groq-Fehler (' + r.status + '): ' + (await r.text()).slice(0, 200));
-    return (await r.json()).choices[0].message.content;
+    const c = (await r.json()).choices[0];
+    return { text: c.message.content, cut: c.finish_reason === 'length' };
   }
   throw new Error('Für die Zusammenfassung fehlt ein Schlüssel (Einstellungen).');
 }
+async function llm(system, user, maxTokens = 4000) {
+  let all = '';
+  for (let round = 0; round < 5; round++) {
+    const messages = [{ role: 'user', content: user }];
+    if (all) messages.push({ role: 'assistant', content: all.trimEnd() }, { role: 'user', content: CONTINUE });
+    const { text, cut } = await llmOnce(system, messages, maxTokens);
+    all += text;
+    if (!cut) break;
+  }
+  return all;
+}
 const STYLE = 'Schreibe auf Deutsch mit echten Umlauten (ä, ö, ü, ß). Verwende keine Gedankenstriche (– oder —); schreibe Bereiche mit „bis“. Erfinde nichts, was nicht im Transkript steht. Deute offensichtliche Transkriptionsfehler sinnvoll.';
 const SUMMARY_SYSTEM = `Du fasst Gesprächsmitschnitte für einen viel beschäftigten Unternehmer zusammen, der sie unterwegs auf dem Handy liest. ${STYLE}
+Decke das ganze Gespräch von Anfang bis Ende ab: Jedes Thema, auch aus dem letzten Teil und auch Nebenthemen, kommt vor. Je länger das Gespräch, desto mehr Kernpunkte.
 Antworte exakt in diesem Format (Markdown), lasse Abschnitte ohne Inhalt weg:
 # <prägnanter Titel, höchstens 6 Wörter>
 ### Kurzfassung
@@ -568,31 +692,68 @@ Antworte exakt in diesem Format (Markdown), lasse Abschnitte ohne Inhalt weg:
 - ...
 ### Offene Fragen
 - ...`;
+const NOTES_SYSTEM = `Du bekommst einen Abschnitt eines langen Gesprächsmitschnitts. Schreibe vollständige Stichpunkte zu allem, was darin vorkommt: Themen, Aussagen, Entscheidungen, Aufgaben, Zahlen, Termine, Namen. Lass nichts weg, behalte die Zeitmarken in eckigen Klammern, keine Einleitung. ${STYLE}`;
+const PART_CHARS = 16000; // etwa 20 Minuten Gespräch; passt auch ins Limit des Groq-Gratistarifs
+function splitText(text, max) {
+  const out = [];
+  let cur = '';
+  for (const line of text.split('\n')) {
+    if (cur && cur.length + line.length + 1 > max) { out.push(cur); cur = ''; }
+    cur += (cur ? '\n' : '') + line;
+  }
+  if (cur) out.push(cur);
+  return out;
+}
+// Lange Gespräche zuerst abschnittsweise verdichten, damit auch das Ende vollständig berücksichtigt wird
+async function condense(text, onProgress) {
+  for (let round = 0; text.length > PART_CHARS && round < 3; round++) {
+    const parts = splitText(text, PART_CHARS);
+    const notes = [];
+    for (let i = 0; i < parts.length; i++) {
+      if (onProgress) await onProgress(i + 1, parts.length);
+      notes.push(await llm(NOTES_SYSTEM, `Abschnitt ${i + 1} von ${parts.length}:\n${parts[i]}`, 2500));
+    }
+    text = notes.join('\n\n');
+  }
+  return text;
+}
 
 function transcriptText(r) {
   if (r.transcript?.segments?.length) return r.transcript.segments.map((s) => `[${fmtTime(s.start)}] ${s.text.trim()}`).join('\n');
   return r.transcript?.text || r.liveText || '';
 }
+const rerun = new Set();
 async function processRec(id, { retranscribe = false, resummarize = false } = {}) {
-  if (working.has(id)) return;
+  if (working.has(id)) { if (!retranscribe && !resummarize) rerun.add(id); return; }
   working.add(id);
   try {
     let r = await getRec(id);
     if (!r) return;
+    if (retranscribe) r = await updateRec(id, { parts: {}, redo: true });
+    if (resummarize) r = await updateRec(id, { resum: true });
+    r = await recoverChunks(r);
+    const open = (x) => x.chunks.findIndex((c, i) => !x.parts?.[chunkIdx(c, i)]);
     // Nur Live-Text vorhanden und noch keine Zusammenfassung: mit Whisper sauber neu transkribieren
     const onlyLive = r.transcript && !r.transcript.segments?.length && !r.summary;
-    if ((!r.transcript || retranscribe || onlyLive) && settings.groq && r.chunks.length) {
-      const segments = [];
-      for (let i = 0; i < r.chunks.length; i++) {
+    const late = r.parts && open(r) >= 0;
+    if ((!r.transcript || r.redo || onlyLive || late) && settings.groq && r.chunks.length) {
+      // Jeder fertige Teil wird sofort gespeichert; nach einer Unterbrechung geht es dort weiter
+      for (;;) {
+        r = await getRec(id);
+        const i = open(r);
+        if (i < 0) break;
+        const c = r.chunks[i], idx = chunkIdx(c, i);
         await updateRec(id, { status: 'transcribing', progress: `Transkribiere Teil ${i + 1} von ${r.chunks.length} …`, error: '' });
-        const blob = await getAudio(id, i);
-        if (!blob || blob.size < 1000) continue;
-        const j = await groqTranscribe(blob, r.chunks[i].type);
-        const off = r.chunks[i].offset;
-        if (j.segments?.length) for (const s of j.segments) segments.push({ start: s.start + off, end: s.end + off, text: s.text });
-        else if (j.text) segments.push({ start: off, end: off + r.chunks[i].dur, text: j.text });
+        const blob = await getAudio(id, idx);
+        const part = !blob ? { segs: [], warn: [{ missing: true, from: c.offset, to: c.offset + c.dur }] }
+          : blob.size < 1000 ? { segs: [], warn: [] }
+          : await transcribeChunk(c, blob);
+        await updateRec(id, (x) => ({ parts: { ...x.parts, [idx]: part } }));
       }
-      r = await updateRec(id, { transcript: { segments, text: segments.map((s) => s.text.trim()).join(' ') } });
+      const { segments, gaps } = buildTranscript(r);
+      const patch = { redo: false, resum: true, gaps };
+      if (segments.length || !r.transcript) patch.transcript = { segments, text: segments.map((s) => s.text.trim()).join(' ') };
+      r = await updateRec(id, patch);
     } else if (!r.transcript && r.liveText) {
       r = await updateRec(id, { transcript: { segments: [], text: r.liveText } });
     }
@@ -604,16 +765,19 @@ async function processRec(id, { retranscribe = false, resummarize = false } = {}
       });
       return;
     }
-    if (!r.summary || resummarize) {
+    if (!r.summary || r.resum) {
       if (!settings.groq && !settings.claude) {
         await updateRec(id, { status: 'error', progress: '', error: 'Für die Zusammenfassung einen Schlüssel in den Einstellungen eintragen.' });
         return;
       }
       await updateRec(id, { status: 'summarizing', progress: 'Fasse zusammen …', error: '' });
       const extra = settings.prompt ? `\n\nZusätzliche Wünsche: ${settings.prompt}` : '';
-      const out = await llm(SUMMARY_SYSTEM + extra, `Datum: ${fmtDate(r.created)}\nDauer: ${fmtTime(r.duration)}\n\nTranskript:\n${text}`);
+      const notes = await condense(text, (i, n) => updateRec(id, { progress: `Lese Abschnitt ${i} von ${n} …` }));
+      await updateRec(id, { progress: 'Fasse zusammen …' });
+      const label = notes === text ? 'Transkript' : 'Vollständige Notizen zum ganzen Gespräch';
+      const out = await llm(SUMMARY_SYSTEM + extra, `Datum: ${fmtDate(r.created)}\nDauer: ${fmtTime(r.duration)}\n\n${label}:\n${notes}`, settings.claude ? 8000 : 4000);
       const m = out.match(/^\s*#\s+(.+)\n/);
-      const patch = { summary: m ? out.slice(m[0].length).trim() : out.trim() };
+      const patch = { summary: m ? out.slice(m[0].length).trim() : out.trim(), resum: false, notes: notes === text ? '' : notes };
       if (m && (r.autoTitle !== false)) patch.title = m[1].trim();
       r = await updateRec(id, patch);
     }
@@ -622,13 +786,17 @@ async function processRec(id, { retranscribe = false, resummarize = false } = {}
     await updateRec(id, { status: 'error', progress: '', error: e.message || String(e) });
   } finally {
     working.delete(id);
+    if (rerun.delete(id)) processRec(id);
   }
 }
 async function ask(id, q) {
   const r = await getRec(id);
+  const full = transcriptText(r);
+  // Groq schafft im Gratistarif keine langen Transkripte am Stück, dann dienen die Notizen als Grundlage
+  const source = settings.claude || full.length <= PART_CHARS ? full : (r.notes || await condense(full));
   const answer = await llm(
     `Du beantwortest Fragen zu einem Gesprächsmitschnitt. Antworte knapp und nenne, wo möglich, die Zeitmarke in eckigen Klammern. Wenn das Gespräch die Antwort nicht hergibt, sag das. ${STYLE}`,
-    `Transkript:\n${transcriptText(r)}\n\nFrage: ${q}`, 1500);
+    `Transkript:\n${source}\n\nFrage: ${q}`, 1500);
   await updateRec(id, (x) => ({ qa: [...(x.qa || []), { q, a: answer }] }));
 }
 
@@ -689,6 +857,11 @@ function renderDetail() {
   st.hidden = !(r.progress || r.error || r.status === 'pending');
   st.className = 'status' + (r.error ? ' err' : '');
   st.textContent = r.error || r.progress || 'Wartet auf Verarbeitung …';
+  const warn = $('#dWarn');
+  warn.hidden = !r.gaps?.length;
+  warn.textContent = (r.gaps || []).map((g) => g.missing
+    ? `${fmtTime(g.from)} bis ${fmtTime(g.to)}: Dieser Audioteil fehlt im Speicher.`
+    : `${fmtTime(g.from)} bis ${fmtTime(g.to)}: Geräusche, aber keine Sprache erkannt. Bitte im Audio nachhören.`).join(' ');
   $('#dSummary').innerHTML = r.summary ? renderMd(r.summary) : '<p class="small">Noch keine Zusammenfassung.</p>';
   const segs = r.transcript?.segments || [];
   $('#dTranscript').innerHTML = segs.length
@@ -708,7 +881,7 @@ async function loadPlayer(r) {
   player.urls.forEach((u) => u && URL.revokeObjectURL(u));
   player = { id: r.id, idx: 0, urls: [] };
   for (let i = 0; i < r.chunks.length; i++) {
-    const b = await getAudio(r.id, i);
+    const b = await getAudio(r.id, chunkIdx(r.chunks[i], i));
     player.urls.push(b ? URL.createObjectURL(b) : null);
   }
   const a = $('#dAudio');
@@ -900,17 +1073,27 @@ $('#dStatus').onclick = () => { if (current?.error && /Schlüssel|Einstellungen/
 window.addEventListener('hashchange', route);
 window.addEventListener('beforeunload', (e) => { if (isRecording()) { e.preventDefault(); e.returnValue = ''; } });
 document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState !== 'visible' || !isRecording()) return;
+  if (document.visibilityState !== 'visible') return;
+  if (!isRecording()) { resumePending(); return; }
   keepAwake();
   if (micBroken()) { if (rec.lostAt) reconnectMic(); else micLost(); }
 });
 
-// Unterbrochene Aufnahmen und offene Verarbeitungen wieder aufnehmen
+// Unterbrochene Aufnahmen, offene Verarbeitungen und ältere Aufnahmen nacheinander abarbeiten
+let resuming = false;
 async function resumePending() {
-  for (const r of await allRecs()) {
-    if (r.status === 'recording' && !isRecording()) await updateRec(r.id, { status: 'pending' });
-    if (['recording', 'pending', 'transcribing', 'summarizing'].includes(r.status) || (r.status === 'error' && !r.summary && (settings.groq || settings.claude))) processRec(r.id);
-  }
+  if (resuming || rec.startedAt) return;
+  resuming = true;
+  try {
+    const recs = (await allRecs()).sort((a, b) => b.created - a.created);
+    for (let r of recs) {
+      if (rec.startedAt) break; // Neue Aufnahme geht vor, danach läuft es weiter
+      if (r.status === 'recording') r = await updateRec(r.id, { status: 'pending' });
+      if (r.pv !== PV && settings.groq && r.status !== 'pending') r = await updateRec(r.id, { pv: PV, parts: {}, redo: r.chunks.length > 0, resum: !!(r.chunks.length || r.transcript) });
+      const open = ['pending', 'transcribing', 'summarizing'].includes(r.status) || (r.redo && settings.groq) || (r.resum && (settings.groq || settings.claude));
+      if (open || (r.status === 'error' && !r.summary && (settings.groq || settings.claude))) await processRec(r.id);
+    }
+  } finally { resuming = false; }
 }
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});

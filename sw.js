@@ -1,5 +1,5 @@
 // Hält die App offline startbar. API-Aufrufe gehen immer direkt ins Netz.
-const CACHE = 'mitschrift-v8';
+const CACHE = 'mitschrift-v9';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'wach.mp4'];
 
 self.addEventListener('install', (e) => {
