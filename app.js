@@ -521,6 +521,17 @@ const KEY_ERR = {
   get groq() { return 'Groq lehnt den Schlüssel' + keyEnd(settings.groq) + ' ab. Hier tippen und ihn in den Einstellungen neu eintragen.'; },
   get claude() { return 'Anthropic lehnt den Claude-Schlüssel' + keyEnd(settings.claude) + ' ab. Hier tippen und ihn in den Einstellungen neu eintragen.'; },
 };
+const sleep = (ms) => new Promise((ok) => setTimeout(ok, ms));
+// Wie lange Groq warten lässt: aus dem Header oder aus dem Fehlertext („try again in 7m30s“)
+async function limitWait(r) {
+  const h = parseFloat(r.headers.get('retry-after') || '');
+  if (h > 0) return h * 1000;
+  const m = (await r.clone().text().catch(() => '')).match(/try again in ((?:[\d.]+(?:ms|h|m|s))+)/i);
+  if (!m) return 0;
+  let ms = 0;
+  for (const [, n, u] of m[1].matchAll(/([\d.]+)(ms|h|m|s)/g)) ms += n * { ms: 1, s: 1000, m: 60000, h: 3600000 }[u];
+  return ms;
+}
 // Wiederholt bei Netzfehlern, Limits und Serverproblemen; hängt nie endlos, auch wenn das Handy die App schlafen legt
 async function fetchRetry(url, opts, tries = 5) {
   for (let a = 1; ; a++) {
@@ -529,11 +540,13 @@ async function fetchRetry(url, opts, tries = 5) {
     let r = null;
     try { r = await fetch(url, { ...opts, signal: ctl.signal }); } catch {} finally { clearTimeout(timer); }
     if (r && r.status !== 429 && r.status < 500) return r;
+    const wait = r?.status === 429 ? await limitWait(r) : 0;
+    if (wait > 60000) { r.limitWait = wait; return r; } // Längere Sperre: nicht blockieren, processRec plant den nächsten Versuch
     if (a >= tries) {
       if (r) return r;
       throw new Error('Keine Verbindung. Die Verarbeitung geht beim nächsten Öffnen der App an dieser Stelle weiter.');
     }
-    await new Promise((ok) => setTimeout(ok, RETRY_MS * a));
+    await sleep(wait ? wait + 1000 : RETRY_MS * a);
   }
 }
 async function groqTranscribe(blob, type, temperature = 0) {
@@ -547,7 +560,7 @@ async function groqTranscribe(blob, type, temperature = 0) {
     method: 'POST', headers: { Authorization: 'Bearer ' + settings.groq }, body: fd,
   });
   if (r.status === 401) throw new Error(KEY_ERR.groq);
-  if (r.status === 429) throw new Error('Das Groq-Limit ist gerade erreicht. Die Transkription geht beim nächsten Öffnen der App an dieser Stelle weiter.');
+  if (r.status === 429) throw Object.assign(new Error('Das Groq-Limit ist gerade erreicht.'), { limitWait: r.limitWait || 300000 });
   if (!r.ok) throw new Error('Transkription fehlgeschlagen (' + r.status + '): ' + (await r.text()).slice(0, 200));
   return r.json();
 }
@@ -723,14 +736,30 @@ function transcriptText(r) {
   return r.transcript?.text || r.liveText || '';
 }
 const rerun = new Set();
+// Nacharbeiten alter Aufnahmen tritt zurück, solange aufgenommen wird oder eine neue Aufnahme verarbeitet wird
+const priority = new Set();
+const isBackfill = (r) => r.backfill ?? (r.pv !== PV || !!r.redo);
+// Whisper-Limit: danach automatisch weitermachen, solange die App offen ist
+let limitUntil = 0, limitTimer = 0;
+function noteLimit(ms) {
+  limitUntil = Date.now() + ms + 2000;
+  clearTimeout(limitTimer);
+  limitTimer = setTimeout(() => { limitUntil = 0; resumePending(); }, ms + 2000);
+  const at = new Date(limitUntil).toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' });
+  return `Groq-Limit erreicht. Geht gegen ${at} Uhr automatisch weiter, wenn die App offen ist.`;
+}
 async function processRec(id, { retranscribe = false, resummarize = false } = {}) {
   if (working.has(id)) { if (!retranscribe && !resummarize) rerun.add(id); return; }
   working.add(id);
+  let back = false;
   try {
     let r = await getRec(id);
     if (!r) return;
-    if (retranscribe) r = await updateRec(id, { parts: {}, redo: true });
-    if (resummarize) r = await updateRec(id, { resum: true });
+    if (retranscribe) r = await updateRec(id, { parts: {}, redo: true, backfill: false });
+    if (resummarize) r = await updateRec(id, { resum: true, backfill: false });
+    back = isBackfill(r);
+    if (!back) priority.add(id);
+    const hold = async () => { while (back && (rec.startedAt || priority.size)) await sleep(1000); };
     r = await recoverChunks(r);
     const open = (x) => x.chunks.findIndex((c, i) => !x.parts?.[chunkIdx(c, i)]);
     // Nur Live-Text vorhanden und noch keine Zusammenfassung: mit Whisper sauber neu transkribieren
@@ -739,6 +768,7 @@ async function processRec(id, { retranscribe = false, resummarize = false } = {}
     if ((!r.transcript || r.redo || onlyLive || late) && settings.groq && r.chunks.length) {
       // Jeder fertige Teil wird sofort gespeichert; nach einer Unterbrechung geht es dort weiter
       for (;;) {
+        await hold();
         r = await getRec(id);
         const i = open(r);
         if (i < 0) break;
@@ -766,6 +796,7 @@ async function processRec(id, { retranscribe = false, resummarize = false } = {}
       return;
     }
     if (!r.summary || r.resum) {
+      await hold();
       if (!settings.groq && !settings.claude) {
         await updateRec(id, { status: 'error', progress: '', error: 'Für die Zusammenfassung einen Schlüssel in den Einstellungen eintragen.' });
         return;
@@ -781,11 +812,13 @@ async function processRec(id, { retranscribe = false, resummarize = false } = {}
       if (m && (r.autoTitle !== false)) patch.title = m[1].trim();
       r = await updateRec(id, patch);
     }
-    await updateRec(id, { status: 'done', progress: '', error: '' });
+    await updateRec(id, { status: 'done', progress: '', error: '', backfill: false });
   } catch (e) {
-    await updateRec(id, { status: 'error', progress: '', error: e.message || String(e) });
+    if (e.limitWait) await updateRec(id, { status: 'pending', progress: noteLimit(e.limitWait), error: '' });
+    else await updateRec(id, { status: 'error', progress: '', error: e.message || String(e) });
   } finally {
     working.delete(id);
+    priority.delete(id);
     if (rerun.delete(id)) processRec(id);
   }
 }
@@ -1080,20 +1113,25 @@ document.addEventListener('visibilitychange', async () => {
 });
 
 // Unterbrochene Aufnahmen, offene Verarbeitungen und ältere Aufnahmen nacheinander abarbeiten
-let resuming = false;
+let resuming = false, resumeAgain = false;
 async function resumePending() {
-  if (resuming || rec.startedAt) return;
+  if (resuming) { resumeAgain = true; return; }
+  if (rec.startedAt || Date.now() < limitUntil) return;
   resuming = true;
   try {
-    const recs = (await allRecs()).sort((a, b) => b.created - a.created);
+    // Neue Aufnahmen zuerst, danach alte; jeweils die neueste voran
+    const recs = (await allRecs()).sort((a, b) => isBackfill(a) - isBackfill(b) || b.created - a.created);
     for (let r of recs) {
-      if (rec.startedAt) break; // Neue Aufnahme geht vor, danach läuft es weiter
+      if (rec.startedAt || Date.now() < limitUntil) break; // Aufnahme oder Limit geht vor, danach läuft es weiter
       if (r.status === 'recording') r = await updateRec(r.id, { status: 'pending' });
-      if (r.pv !== PV && settings.groq && r.status !== 'pending') r = await updateRec(r.id, { pv: PV, parts: {}, redo: r.chunks.length > 0, resum: !!(r.chunks.length || r.transcript) });
+      if (r.pv !== PV && settings.groq && r.status !== 'pending') r = await updateRec(r.id, { pv: PV, parts: {}, redo: r.chunks.length > 0, resum: !!(r.chunks.length || r.transcript), backfill: true });
       const open = ['pending', 'transcribing', 'summarizing'].includes(r.status) || (r.redo && settings.groq) || (r.resum && (settings.groq || settings.claude));
       if (open || (r.status === 'error' && !r.summary && (settings.groq || settings.claude))) await processRec(r.id);
     }
-  } finally { resuming = false; }
+  } finally {
+    resuming = false;
+    if (resumeAgain) { resumeAgain = false; resumePending(); }
+  }
 }
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
