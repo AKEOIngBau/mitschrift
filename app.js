@@ -462,14 +462,18 @@ async function importFile(file) {
   location.hash = '#/r/' + id;
   processRec(id);
 }
+// Wartet höchstens ms; danach gilt fallback. Das iPhone meldet manche Ereignisse im Hintergrund nie.
+const withTimeout = (p, ms, fallback) => Promise.race([p, new Promise((ok) => setTimeout(() => ok(fallback), ms))]);
 function probeDuration(blob) {
-  return new Promise((res) => {
+  const url = URL.createObjectURL(blob);
+  return withTimeout(new Promise((res) => {
     const a = new Audio();
     a.preload = 'metadata';
-    a.onloadedmetadata = () => { const d = a.duration; URL.revokeObjectURL(a.src); res(isFinite(d) ? d : 0); };
+    a.onloadedmetadata = () => res(isFinite(a.duration) ? a.duration : 0);
     a.onerror = () => res(0);
-    a.src = URL.createObjectURL(blob);
-  });
+    a.src = url;
+    try { a.load(); } catch {}
+  }), 8000, 0).finally(() => URL.revokeObjectURL(url));
 }
 const RATE = 16000;
 async function decodeMono(file) {
@@ -591,13 +595,17 @@ function hasSound(pcm, gap) {
   }
   return total > 0 && loud / total >= 0.05;
 }
+let decodeStuck = false;
 async function transcribeChunk(c, blob) {
   const j = await groqTranscribe(blob, c.type);
   let segs = toSegs(j, 0, c.dur);
   const warn = [];
   const small = c.dur ? c.dur <= 1800 : blob.size <= 10 * 1024 * 1024; // längere Dateien passen nicht sicher in den Handy-Speicher
   let pcm = null;
-  if (small) { try { pcm = await decodeMono(blob); } catch {} }
+  if (small && !decodeStuck) {
+    try { pcm = await withTimeout(decodeMono(blob), 90000, 'stuck'); } catch {}
+    if (pcm === 'stuck') { pcm = null; decodeStuck = true; } // Einmal gehangen: in dieser Sitzung nicht mehr versuchen
+  }
   if (!pcm) {
     const last = segs.reduce((m, s) => Math.max(m, s.end), 0);
     if (c.dur - last >= 60) warn.push({ from: last, to: c.dur });
@@ -735,6 +743,7 @@ function transcriptText(r) {
   if (r.transcript?.segments?.length) return r.transcript.segments.map((s) => `[${fmtTime(s.start)}] ${s.text.trim()}`).join('\n');
   return r.transcript?.text || r.liveText || '';
 }
+const DIAG_VERSION = 'v11';
 const rerun = new Set();
 // Nacharbeiten alter Aufnahmen tritt zurück, solange aufgenommen wird oder eine neue Aufnahme verarbeitet wird
 const priority = new Set();
@@ -1023,9 +1032,14 @@ $('#aCopy').onclick = async () => { if (current) { await navigator.clipboard.wri
 $('#aRetx').onclick = () => {
   if (!current) return;
   if (!settings.groq) { toast('Dafür den Groq-Schlüssel in den Einstellungen eintragen.'); return; }
+  if (working.has(current.id)) { toast('Diese Aufnahme wird gerade schon verarbeitet.'); return; }
   processRec(current.id, { retranscribe: true, resummarize: true });
 };
-$('#aResum').onclick = () => current && processRec(current.id, { resummarize: true });
+$('#aResum').onclick = () => {
+  if (!current) return;
+  if (working.has(current.id)) { toast('Diese Aufnahme wird gerade schon verarbeitet.'); return; }
+  processRec(current.id, { resummarize: true });
+};
 $('#aDelete').onclick = async () => {
   if (!current || !confirm('Dieses Gespräch mit Audio endgültig löschen?')) return;
   await deleteRec(current);
@@ -1099,6 +1113,30 @@ $('#sBackup').onclick = async () => {
 };
 $('#sBackupShare').onclick = async () => {
   try { await navigator.share({ title: 'Mitschrift Sicherungslink', text: $('#sBackupText').value }); } catch {}
+};
+$('#sDiag').onclick = async () => {
+  const recs = (await allRecs()).sort((a, b) => b.created - a.created);
+  const keys = await tx('audio', 'readonly', (s) => s.getAllKeys());
+  const lines = [
+    `Mitschrift-Diagnose ${new Date().toLocaleString('de-DE')} | Version ${DIAG_VERSION}`,
+    `Groq-Schlüssel: ${settings.groq ? 'ja' + keyEnd(settings.groq) : 'nein'} | Claude-Schlüssel: ${settings.claude ? 'ja' + keyEnd(settings.claude) : 'nein'}`,
+    `In Arbeit: ${[...working].join(', ') || 'nichts'} | Warteschlange läuft: ${resuming ? 'ja' : 'nein'} | Limit bis: ${limitUntil > Date.now() ? new Date(limitUntil).toLocaleTimeString('de-DE') : 'keins'}`,
+  ];
+  for (const r of recs) {
+    const audio = keys.filter((k) => String(k).startsWith(r.id + ':')).length;
+    const parts = Object.keys(r.parts || {}).length;
+    lines.push([
+      fmtDate(r.created), (r.title || '').slice(0, 30), `Status ${r.status}`, `Dauer ${fmtTime(r.duration || 0)}`,
+      `Teile ${r.chunks?.length || 0}, Audio ${audio}, fertig ${parts}`, `pv ${r.pv ?? '-'}`,
+      `nach ${r.backfill ? 'j' : 'n'}/${r.redo ? 'j' : 'n'}/${r.resum ? 'j' : 'n'}`,
+      `Text ${(r.transcript?.text || '').length}, Zus ${(r.summary || '').length}`,
+      r.gaps?.length ? `Lücken ${r.gaps.length}` : '', r.progress || '', r.error ? `Fehler: ${r.error}` : '',
+    ].filter(Boolean).join(' | '));
+  }
+  const text = lines.join('\n');
+  $('#sDiagText').value = text;
+  $('#sDiagText').hidden = false;
+  try { await navigator.clipboard.writeText(text); toast('Diagnose kopiert. Schick sie mir.'); } catch { toast('Text markieren und kopieren.'); }
 };
 $('#sBackupHide').onclick = () => { $('#sBackupText').value = ''; $('#sBackupBox').hidden = true; };
 $('#dStatus').onclick = () => { if (current?.error && /Schlüssel|Einstellungen/.test(current.error)) location.hash = '#/settings'; };
