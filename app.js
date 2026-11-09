@@ -373,6 +373,7 @@ async function stopRecording() {
   setRecUi('off');
   await updateRec(id, { status: 'pending', liveText: live });
   location.hash = '#/r/' + id;
+  if (updateReady) { location.reload(); return; } // Verarbeitung läuft nach dem Neuladen an derselben Stelle weiter
   processRec(id).then(resumePending);
 }
 function setRecUi(state) {
@@ -778,7 +779,7 @@ function transcriptText(r) {
   if (r.transcript?.segments?.length) return r.transcript.segments.map((s) => `[${fmtTime(s.start)}] ${s.text.trim()}`).join('\n');
   return r.transcript?.text || r.liveText || '';
 }
-const DIAG_VERSION = 'v14';
+const DIAG_VERSION = 'v15';
 const rerun = new Set();
 // Nacharbeiten alter Aufnahmen tritt zurück, solange aufgenommen wird oder eine neue Aufnahme verarbeitet wird
 const priority = new Set();
@@ -1197,6 +1198,7 @@ window.addEventListener('hashchange', route);
 window.addEventListener('beforeunload', (e) => { if (isRecording()) { e.preventDefault(); e.returnValue = ''; } });
 document.addEventListener('visibilitychange', async () => {
   if (document.visibilityState !== 'visible') return;
+  checkUpdate();
   if (!isRecording()) { resumePending(); return; }
   keepAwake();
   if (micBroken()) { if (rec.lostAt) reconnectMic(); else micLost(); }
@@ -1224,7 +1226,19 @@ async function resumePending() {
   }
 }
 
-if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+// Neue Versionen kommen von selbst: beim Öffnen und beim Zurückkehren nachsehen, dann neu laden.
+// Während einer Aufnahme wird nie neu geladen, sondern erst nach dem Stopp.
+let updateReady = false;
+function applyUpdate() {
+  if (isRecording()) { updateReady = true; return; }
+  location.reload();
+}
+function checkUpdate() { navigator.serviceWorker?.getRegistration().then((g) => g?.update()).catch(() => {}); }
+if ('serviceWorker' in navigator) {
+  const hadController = !!navigator.serviceWorker.controller;
+  navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController) applyUpdate(); });
+  navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).catch(() => {});
+}
 try { navigator.storage?.persist?.(); } catch {}
 importSetupLink();
 restoreSettings().then(() => { updateKeyState(); return route(); }).then(resumePending);

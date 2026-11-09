@@ -1,5 +1,5 @@
 // Hält die App offline startbar. API-Aufrufe gehen immer direkt ins Netz.
-const CACHE = 'mitschrift-v14';
+const CACHE = 'mitschrift-v15';
 const FILES = ['./', 'index.html', 'style.css', 'app.js', 'manifest.webmanifest', 'icon.svg', 'icon-192.png', 'icon-512.png', 'wach.mp4'];
 
 self.addEventListener('install', (e) => {
@@ -15,7 +15,8 @@ self.addEventListener('fetch', (e) => {
   if (e.request.method !== 'GET' || url.origin !== location.origin) return;
   // Netz zuerst, damit Updates sofort ankommen; ohne Netz aus dem Cache
   e.respondWith(
-    fetch(e.request)
+    // Am Browser-Zwischenspeicher vorbei, damit eine neue Version sofort ankommt (Videos mit Range-Anfrage ausgenommen)
+    fetch(e.request.headers.has('range') ? e.request : new Request(e.request.url, { cache: 'no-cache', credentials: 'same-origin' }))
       .then((r) => { const copy = r.clone(); caches.open(CACHE).then((c) => c.put(e.request, copy)); return r; })
       .catch(() => caches.match(e.request, { ignoreSearch: true }))
   );
