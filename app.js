@@ -229,6 +229,9 @@ function micBack(newStream) {
   const gap = Math.round((Date.now() - rec.lostAt) / 1000);
   if (rec.pausedAt === rec.lostAt) { rec.pausedTotal += Date.now() - rec.pausedAt; rec.pausedAt = 0; }
   rec.lostAt = 0;
+  rec.busyShown = false;
+  clearTimeout(rec.retryTimer);
+  if (!rec.pausedAt) $('#recHint').textContent = 'Aufnahme läuft. Bildschirm bleibt an, nicht die Seitentaste drücken.';
   if (gap >= 3) toast(`Aufnahme läuft weiter. Das Handy hatte das Mikrofon ${fmtTime(gap)} gesperrt.`, 5000);
   if (newStream) { stopMeter(); startMeter(); }
 }
@@ -250,9 +253,18 @@ async function reconnectMic() {
     newRecorder();
     if (rec.pausedAt) rec.recorder.pause();
   } catch (e) {
-    toast('Mikrofon nicht mehr verfügbar. Aufnahme bis hierhin gespeichert.', 6000);
-    rec.lostAt = 0;
-    toggleRec(true);
+    // Mikrofon belegt, zum Beispiel durch einen Anruf: nicht beenden, sondern warten und es wieder versuchen
+    if (rec.lostAt && Date.now() - rec.lostAt < 60 * 60000) {
+      if (!rec.busyShown) toast('Mikrofon ist belegt, zum Beispiel durch einen Anruf. Die Aufnahme geht weiter, sobald es frei ist.', 6000);
+      rec.busyShown = true;
+      $('#recHint').textContent = 'Mikrofon belegt. Die Aufnahme geht automatisch weiter, sobald es frei ist.';
+      clearTimeout(rec.retryTimer);
+      rec.retryTimer = setTimeout(() => { if (isRecording() && rec.lostAt && document.visibilityState === 'visible') reconnectMic(); }, 5000);
+    } else {
+      toast('Mikrofon nicht mehr verfügbar. Aufnahme bis hierhin gespeichert.', 6000);
+      rec.lostAt = 0;
+      toggleRec(true);
+    }
   } finally {
     reconnecting = false;
   }
@@ -338,6 +350,7 @@ async function stopRecording() {
   if (!rec.recorder) return;
   if (rec.pausedAt) { rec.pausedTotal += Date.now() - rec.pausedAt; rec.pausedAt = 0; }
   rec.lostAt = 0;
+  clearTimeout(rec.retryTimer);
   clearInterval(rec.rotateTimer);
   clearInterval(rec.tick);
   const r = rec.recorder;
@@ -765,7 +778,7 @@ function transcriptText(r) {
   if (r.transcript?.segments?.length) return r.transcript.segments.map((s) => `[${fmtTime(s.start)}] ${s.text.trim()}`).join('\n');
   return r.transcript?.text || r.liveText || '';
 }
-const DIAG_VERSION = 'v13';
+const DIAG_VERSION = 'v14';
 const rerun = new Set();
 // Nacharbeiten alter Aufnahmen tritt zurück, solange aufgenommen wird oder eine neue Aufnahme verarbeitet wird
 const priority = new Set();
