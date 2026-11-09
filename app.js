@@ -260,8 +260,29 @@ async function reconnectMic() {
 function micBroken() {
   if (!isRecording()) return false;
   const tracks = rec.stream?.getAudioTracks() || [];
-  return !!rec.lostAt || rec.recorder.state === 'inactive' || tracks.some((t) => t.readyState === 'ended');
+  return !!rec.lostAt || rec.recorder.state === 'inactive' || tracks.some((t) => t.readyState === 'ended' || t.muted);
 }
+
+// Wächter: Das iPhone schaltet das Mikrofon manchmal nur stumm, ohne es zu beenden. Dann entstehen leere
+// Dateien, bis man Stopp drückt. Kommt 8 Sekunden lang exakt kein Signal, wird neu verbunden.
+let flatSince = 0;
+function micWatch() {
+  if (!isRecording() || rec.pausedAt || rec.lostAt || reconnecting) { flatSince = 0; return; }
+  const muted = (rec.stream?.getAudioTracks() || []).some((t) => t.muted || t.readyState === 'ended');
+  let flat = false;
+  if (rec.analyser && rec.audioCtx?.state === 'running') {
+    const d = new Float32Array(rec.analyser.fftSize);
+    rec.analyser.getFloatTimeDomainData(d);
+    flat = d.every((v) => v === 0); // echte Stille im Raum ist nie exakt null, ein stummes Mikrofon schon
+  }
+  if (!muted && !flat) { flatSince = 0; return; }
+  flatSince ||= Date.now();
+  if (Date.now() - flatSince < 8000) return;
+  flatSince = 0;
+  if (document.visibilityState === 'visible') toast('Das Mikrofon lieferte keinen Ton mehr. Es wird neu verbunden.', 5000);
+  micLost(); // sichtbar: sofort neu verbinden; im Hintergrund: sobald die App wieder offen ist
+}
+setInterval(micWatch, 2000);
 
 function newRecorder() {
   const idx = rec.idx;
@@ -276,6 +297,7 @@ function newRecorder() {
     const blob = new Blob(parts, { type: r.mimeType || rec.mime || 'audio/webm' });
     const dur = (r.endAt ?? elapsed()) - offset;
     const id = rec.id;
+    if (blob.size < 1000 && dur > 30 && isRecording() && rec.id === id) micLost(); // ganzer Abschnitt ohne Ton
     rec.saving = rec.saving.then(async () => {
       await putAudio(id, idx, blob);
       const x = await updateRec(id, (x) => ({
@@ -743,7 +765,7 @@ function transcriptText(r) {
   if (r.transcript?.segments?.length) return r.transcript.segments.map((s) => `[${fmtTime(s.start)}] ${s.text.trim()}`).join('\n');
   return r.transcript?.text || r.liveText || '';
 }
-const DIAG_VERSION = 'v12';
+const DIAG_VERSION = 'v13';
 const rerun = new Set();
 // Nacharbeiten alter Aufnahmen tritt zurück, solange aufgenommen wird oder eine neue Aufnahme verarbeitet wird
 const priority = new Set();
@@ -900,10 +922,20 @@ function renderDetail() {
   st.className = 'status' + (r.error ? ' err' : '');
   st.textContent = r.error || r.progress || 'Wartet auf Verarbeitung …';
   const warn = $('#dWarn');
-  warn.hidden = !r.gaps?.length;
-  warn.textContent = (r.gaps || []).map((g) => g.missing
-    ? `${fmtTime(g.from)} bis ${fmtTime(g.to)}: Dieser Audioteil fehlt im Speicher.`
-    : `${fmtTime(g.from)} bis ${fmtTime(g.to)}: Geräusche, aber keine Sprache erkannt. Bitte im Audio nachhören.`).join(' ');
+  const silent = [];
+  for (const c of [...(r.chunks || [])].sort((a, b) => a.offset - b.offset)) {
+    if (!(c.size < 1000 && c.dur >= 10)) continue;
+    const last = silent[silent.length - 1];
+    if (last && c.offset - last.to < 2) last.to = c.offset + c.dur; else silent.push({ from: c.offset, to: c.offset + c.dur });
+  }
+  const notes = [
+    ...silent.map((g) => `${fmtTime(g.from)} bis ${fmtTime(g.to)}: Kein Ton aufgenommen, das Handy hatte das Mikrofon abgeschaltet.`),
+    ...(r.gaps || []).map((g) => g.missing
+      ? `${fmtTime(g.from)} bis ${fmtTime(g.to)}: Dieser Audioteil fehlt im Speicher.`
+      : `${fmtTime(g.from)} bis ${fmtTime(g.to)}: Geräusche, aber keine Sprache erkannt. Bitte im Audio nachhören.`),
+  ];
+  warn.hidden = !notes.length;
+  warn.textContent = notes.join(' ');
   $('#dSummary').innerHTML = r.summary ? renderMd(r.summary) : '<p class="small">Noch keine Zusammenfassung.</p>';
   const segs = r.transcript?.segments || [];
   $('#dTranscript').innerHTML = segs.length
