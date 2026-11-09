@@ -743,7 +743,7 @@ function transcriptText(r) {
   if (r.transcript?.segments?.length) return r.transcript.segments.map((s) => `[${fmtTime(s.start)}] ${s.text.trim()}`).join('\n');
   return r.transcript?.text || r.liveText || '';
 }
-const DIAG_VERSION = 'v11';
+const DIAG_VERSION = 'v12';
 const rerun = new Set();
 // Nacharbeiten alter Aufnahmen tritt zurück, solange aufgenommen wird oder eine neue Aufnahme verarbeitet wird
 const priority = new Set();
@@ -1130,8 +1130,15 @@ $('#sDiag').onclick = async () => {
       `Teile ${r.chunks?.length || 0}, Audio ${audio}, fertig ${parts}`, `pv ${r.pv ?? '-'}`,
       `nach ${r.backfill ? 'j' : 'n'}/${r.redo ? 'j' : 'n'}/${r.resum ? 'j' : 'n'}`,
       `Text ${(r.transcript?.text || '').length}, Zus ${(r.summary || '').length}`,
-      r.gaps?.length ? `Lücken ${r.gaps.length}` : '', r.progress || '', r.error ? `Fehler: ${r.error}` : '',
+      r.gaps?.length ? `Lücken ${r.gaps.map((g) => fmtTime(g.from) + ' bis ' + fmtTime(g.to)).join(', ')}` : '', r.progress || '', r.error ? `Fehler: ${r.error}` : '',
     ].filter(Boolean).join(' | '));
+    // Je Abschnitt: Startzeit, Länge laut App, Dateigröße, wie weit Whisper Text geliefert hat
+    for (const [i, c] of (r.chunks || []).entries()) {
+      const idx = chunkIdx(c, i), segs = r.parts?.[idx]?.segs;
+      const blob = audio ? await getAudio(r.id, idx) : null;
+      const textTo = segs?.length ? fmtTime(Math.max(...segs.map((s) => s.end))) : (segs ? 'kein Text' : 'offen');
+      lines.push(`   Teil ${idx}: ab ${fmtTime(c.offset || 0)}, Länge ${fmtTime(c.dur || 0)}, ${blob ? Math.round(blob.size / 1024) + ' KB ' + (blob.type || '') : 'kein Audio'}, Text bis ${textTo}`);
+    }
   }
   const text = lines.join('\n');
   $('#sDiagText').value = text;
