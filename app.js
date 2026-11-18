@@ -779,7 +779,7 @@ function transcriptText(r) {
   if (r.transcript?.segments?.length) return r.transcript.segments.map((s) => `[${fmtTime(s.start)}] ${s.text.trim()}`).join('\n');
   return r.transcript?.text || r.liveText || '';
 }
-const DIAG_VERSION = 'v15';
+const DIAG_VERSION = 'v16';
 const rerun = new Set();
 // Nacharbeiten alter Aufnahmen tritt zurück, solange aufgenommen wird oder eine neue Aufnahme verarbeitet wird
 const priority = new Set();
@@ -1183,7 +1183,16 @@ $('#sDiag').onclick = async () => {
       const idx = chunkIdx(c, i), segs = r.parts?.[idx]?.segs;
       const blob = audio ? await getAudio(r.id, idx) : null;
       const textTo = segs?.length ? fmtTime(Math.max(...segs.map((s) => s.end))) : (segs ? 'kein Text' : 'offen');
-      lines.push(`   Teil ${idx}: ab ${fmtTime(c.offset || 0)}, Länge ${fmtTime(c.dur || 0)}, ${blob ? Math.round(blob.size / 1024) + ' KB ' + (blob.type || '') : 'kein Audio'}, Text bis ${textTo}`);
+      // Längste Strecke ohne erkannten Text innerhalb des Abschnitts (Anfang und Ende eingeschlossen)
+      let pause = 0, pauseAt = 0, last = 0;
+      for (const s of [...(segs || [])].sort((a, b) => a.start - b.start)) {
+        if (s.start - last > pause) { pause = s.start - last; pauseAt = last; }
+        last = Math.max(last, s.end);
+      }
+      if (segs?.length && (c.dur || 0) - last > pause) { pause = c.dur - last; pauseAt = last; }
+      const chars = (segs || []).reduce((n, s) => n + s.text.trim().length, 0);
+      const extra = segs?.length ? `, ${chars} Zeichen, längste Pause ${fmtTime(pause)} ab ${fmtTime(pauseAt)}` : '';
+      lines.push(`   Teil ${idx}: ab ${fmtTime(c.offset || 0)}, Länge ${fmtTime(c.dur || 0)}, ${blob ? Math.round(blob.size / 1024) + ' KB ' + (blob.type || '') : 'kein Audio'}, Text bis ${textTo}${extra}`);
     }
   }
   const text = lines.join('\n');
