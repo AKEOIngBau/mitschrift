@@ -4,7 +4,7 @@
 const $ = (s) => document.querySelector(s);
 const CHUNK_MS = 5 * 60 * 1000; // alle 5 Minuten eine neue Audiodatei, damit nichts zu groß wird
 const MAX_UPLOAD = 24 * 1024 * 1024;
-const PV = 2; // Stand der Verarbeitung; ältere Aufnahmen werden beim Öffnen einmal automatisch nachgearbeitet
+const PV = 3; // Stand der Verarbeitung; ältere Aufnahmen werden beim Öffnen einmal automatisch nachgearbeitet
 const MIC = { audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true } }; // Filter wie im Telefonat schlucken leise und entfernte Stimmen
 
 function toast(msg, ms = 2500) {
@@ -589,10 +589,10 @@ async function fetchRetry(url, opts, tries = 5) {
     await sleep(wait ? wait + 1000 : RETRY_MS * a);
   }
 }
-async function groqTranscribe(blob, type, temperature = 0) {
+async function groqTranscribe(blob, type, temperature = 0, model = 'whisper-large-v3') {
   const fd = new FormData();
   fd.append('file', blob, 'audio.' + extFor(type || blob.type));
-  fd.append('model', 'whisper-large-v3');
+  fd.append('model', model);
   fd.append('response_format', 'verbose_json');
   fd.append('temperature', String(temperature));
   if (settings.lang) fd.append('language', settings.lang);
@@ -631,6 +631,22 @@ function hasSound(pcm, gap) {
   }
   return total > 0 && loud / total >= 0.05;
 }
+// Whisper lässt manchmal ganze 30-Sekunden-Fenster aus. Kann das Handy das Audio nicht zerschneiden
+// (das iPhone dekodiert diese Dateien oft nicht), hört ein anderes Modell den ganzen Abschnitt noch einmal,
+// und nur Text, der in eine Lücke fällt, wird übernommen.
+const GAP_REFILL = 25;
+const bigGaps = (segs, dur) => findGaps(segs, dur).filter((g) => g.to - g.from >= GAP_REFILL);
+async function fillGaps(c, blob, segs) {
+  const passes = [['whisper-large-v3-turbo', 0], ['whisper-large-v3', 0.4]];
+  for (const [model, temp] of passes) {
+    const gaps = bigGaps(segs, c.dur || 0);
+    if (!gaps.length) break;
+    const extra = toSegs(await groqTranscribe(blob, c.type, temp, model), 0, c.dur);
+    const inGap = (s) => { const mid = (s.start + s.end) / 2; return gaps.some((g) => mid >= g.from && mid <= g.to); };
+    segs = segs.concat(extra.filter(inGap)).sort((a, b) => a.start - b.start);
+  }
+  return segs;
+}
 let decodeStuck = false;
 async function transcribeChunk(c, blob) {
   const j = await groqTranscribe(blob, c.type);
@@ -643,6 +659,7 @@ async function transcribeChunk(c, blob) {
     if (pcm === 'stuck') { pcm = null; decodeStuck = true; } // Einmal gehangen: in dieser Sitzung nicht mehr versuchen
   }
   if (!pcm) {
+    segs = await fillGaps(c, blob, segs);
     const last = segs.reduce((m, s) => Math.max(m, s.end), 0);
     if (c.dur - last >= 60) warn.push({ from: last, to: c.dur });
     return { segs, warn };
@@ -779,7 +796,7 @@ function transcriptText(r) {
   if (r.transcript?.segments?.length) return r.transcript.segments.map((s) => `[${fmtTime(s.start)}] ${s.text.trim()}`).join('\n');
   return r.transcript?.text || r.liveText || '';
 }
-const DIAG_VERSION = 'v16';
+const DIAG_VERSION = 'v17';
 const rerun = new Set();
 // Nacharbeiten alter Aufnahmen tritt zurück, solange aufgenommen wird oder eine neue Aufnahme verarbeitet wird
 const priority = new Set();
@@ -806,7 +823,7 @@ async function processRec(id, { retranscribe = false, resummarize = false } = {}
     if (!back) priority.add(id);
     const hold = async () => { while (back && (rec.startedAt || priority.size)) await sleep(1000); };
     r = await recoverChunks(r);
-    const open = (x) => x.chunks.findIndex((c, i) => !x.parts?.[chunkIdx(c, i)]);
+    const open = (x) => x.chunks.findIndex((c, i) => { const p = x.parts?.[chunkIdx(c, i)]; return !p || p.refill; });
     // Nur Live-Text vorhanden und noch keine Zusammenfassung: mit Whisper sauber neu transkribieren
     const onlyLive = r.transcript && !r.transcript.segments?.length && !r.summary;
     const late = r.parts && open(r) >= 0;
@@ -820,7 +837,9 @@ async function processRec(id, { retranscribe = false, resummarize = false } = {}
         const c = r.chunks[i], idx = chunkIdx(c, i);
         await updateRec(id, { status: 'transcribing', progress: `Transkribiere Teil ${i + 1} von ${r.chunks.length} …`, error: '' });
         const blob = await getAudio(id, idx);
-        const part = !blob ? { segs: [], warn: [{ missing: true, from: c.offset, to: c.offset + c.dur }] }
+        const old = r.parts?.[idx];
+        const part = old?.refill ? { segs: blob && blob.size >= 1000 ? await fillGaps(c, blob, old.segs) : old.segs, warn: old.warn || [] }
+          : !blob ? { segs: [], warn: [{ missing: true, from: c.offset, to: c.offset + c.dur }] }
           : blob.size < 1000 ? { segs: [], warn: [] }
           : await transcribeChunk(c, blob);
         await updateRec(id, (x) => ({ parts: { ...x.parts, [idx]: part } }));
@@ -1225,7 +1244,19 @@ async function resumePending() {
     for (let r of recs) {
       if (rec.startedAt || Date.now() < limitUntil) break; // Aufnahme oder Limit geht vor, danach läuft es weiter
       if (r.status === 'recording') r = await updateRec(r.id, { status: 'pending' });
-      if (r.pv !== PV && settings.groq && r.status !== 'pending') r = await updateRec(r.id, { pv: PV, parts: {}, redo: r.chunks.length > 0, resum: !!(r.chunks.length || r.transcript), backfill: true });
+      if ((r.pv ?? 1) < 2 && settings.groq && r.status !== 'pending') r = await updateRec(r.id, { pv: PV, parts: {}, redo: r.chunks.length > 0, resum: !!(r.chunks.length || r.transcript), backfill: true });
+      else if (r.pv === 2 && settings.groq && r.status !== 'pending') {
+        // Nur Abschnitte mit Ton, in denen Whisper ein ganzes Fenster ausgelassen hat, noch einmal anhören
+        r = await updateRec(r.id, (x) => {
+          const parts = { ...(x.parts || {}) };
+          let n = 0;
+          x.chunks.forEach((c, i) => {
+            const k = chunkIdx(c, i), q = parts[k];
+            if (q?.segs?.length && (c.size ?? 1000) >= 1000 && bigGaps(q.segs, c.dur || 0).length) { parts[k] = { ...q, refill: true }; n++; }
+          });
+          return n ? { pv: PV, parts, resum: true, backfill: true } : { pv: PV };
+        });
+      }
       const open = ['pending', 'transcribing', 'summarizing'].includes(r.status) || (r.redo && settings.groq) || (r.resum && (settings.groq || settings.claude));
       if (open || (r.status === 'error' && !r.summary && (settings.groq || settings.claude))) await processRec(r.id);
     }
