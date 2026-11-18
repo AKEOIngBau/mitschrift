@@ -796,7 +796,7 @@ function transcriptText(r) {
   if (r.transcript?.segments?.length) return r.transcript.segments.map((s) => `[${fmtTime(s.start)}] ${s.text.trim()}`).join('\n');
   return r.transcript?.text || r.liveText || '';
 }
-const DIAG_VERSION = 'v17';
+const DIAG_VERSION = 'v18';
 const rerun = new Set();
 // Nacharbeiten alter Aufnahmen tritt zurück, solange aufgenommen wird oder eine neue Aufnahme verarbeitet wird
 const priority = new Set();
@@ -1185,7 +1185,7 @@ $('#sDiag').onclick = async () => {
   const lines = [
     `Mitschrift-Diagnose ${new Date().toLocaleString('de-DE')} | Version ${DIAG_VERSION}`,
     `Groq-Schlüssel: ${settings.groq ? 'ja' + keyEnd(settings.groq) : 'nein'} | Claude-Schlüssel: ${settings.claude ? 'ja' + keyEnd(settings.claude) : 'nein'}`,
-    `In Arbeit: ${[...working].join(', ') || 'nichts'} | Warteschlange läuft: ${resuming ? 'ja' : 'nein'} | Limit bis: ${limitUntil > Date.now() ? new Date(limitUntil).toLocaleTimeString('de-DE') : 'keins'}`,
+    `In Arbeit: ${[...working].map((id) => { const x = recs.find((r) => r.id === id); return x ? fmtDate(x.created) : id; }).join(', ') || 'nichts'} | Warteschlange läuft: ${resuming ? 'ja' : 'nein'} | Limit bis: ${limitUntil > Date.now() ? new Date(limitUntil).toLocaleTimeString('de-DE') : 'keins'}`,
   ];
   for (const r of recs) {
     const audio = keys.filter((k) => String(k).startsWith(r.id + ':')).length;
@@ -1240,7 +1240,9 @@ async function resumePending() {
   resuming = true;
   try {
     // Neue Aufnahmen zuerst, danach alte; jeweils die neueste voran
-    const recs = (await allRecs()).sort((a, b) => isBackfill(a) - isBackfill(b) || b.created - a.created);
+    // Neue Aufnahmen zuerst; alles, was nachgearbeitet wird oder noch geprüft werden muss, danach. Jeweils die neueste voran.
+    const fresh = (r) => r.pv === PV && !r.backfill && !r.redo;
+    const recs = (await allRecs()).sort((a, b) => fresh(b) - fresh(a) || b.created - a.created);
     for (let r of recs) {
       if (rec.startedAt || Date.now() < limitUntil) break; // Aufnahme oder Limit geht vor, danach läuft es weiter
       if (r.status === 'recording') r = await updateRec(r.id, { status: 'pending' });
