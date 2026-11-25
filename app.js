@@ -226,6 +226,10 @@ function micLost() {
   if (document.visibilityState === 'visible') reconnectMic();
 }
 function micBack(newStream) {
+  if (newStream) { stopMeter(); startMeter(); }
+  // Schon zurück (zum Beispiel kam der Ton nach dem Anruf von selbst wieder, während neu verbunden wurde):
+  // sonst würde die Pause ein zweites Mal abgezogen und alle späteren Abschnitte bekämen falsche Zeiten
+  if (!rec.lostAt) return;
   const gap = Math.round((Date.now() - rec.lostAt) / 1000);
   if (rec.pausedAt === rec.lostAt) { rec.pausedTotal += Date.now() - rec.pausedAt; rec.pausedAt = 0; }
   rec.lostAt = 0;
@@ -233,7 +237,6 @@ function micBack(newStream) {
   clearTimeout(rec.retryTimer);
   if (!rec.pausedAt) $('#recHint').textContent = 'Aufnahme läuft. Bildschirm bleibt an, nicht die Seitentaste drücken.';
   if (gap >= 3) toast(`Aufnahme läuft weiter. Das Handy hatte das Mikrofon ${fmtTime(gap)} gesperrt.`, 5000);
-  if (newStream) { stopMeter(); startMeter(); }
 }
 let reconnecting = false;
 async function reconnectMic() {
@@ -687,6 +690,23 @@ function buildTranscript(r) {
   segments.sort((a, b) => a.start - b.start);
   return { segments, gaps };
 }
+// Abschnitte, deren Start durch die doppelt gezählte Pause negativ wurde, der Reihe nach hinten anhängen
+function fixOffsets(x) {
+  const chunks = x.chunks.map((c, i) => ({ ...c, idx: chunkIdx(c, i) })).sort((a, b) => a.idx - b.idx);
+  let end = 0;
+  for (const c of chunks) {
+    if (!(c.offset >= 0)) c.offset = end;
+    end = Math.max(end, c.offset + (c.dur || 0));
+  }
+  chunks.sort((a, b) => a.offset - b.offset || a.idx - b.idx);
+  const patch = { chunks, duration: Math.max(x.duration || 0, end) };
+  if (x.parts && Object.keys(x.parts).length) {
+    const { segments, gaps } = buildTranscript({ ...x, chunks });
+    if (segments.length) Object.assign(patch, { transcript: { segments, text: segments.map((s) => s.text.trim()).join(' ') }, gaps });
+    if (x.summary) Object.assign(patch, { resum: true, backfill: true });
+  }
+  return patch;
+}
 // Audio, das gespeichert ist, aber in der Liste der Teile fehlt, wieder einhängen
 async function recoverChunks(r) {
   const keys = await tx('audio', 'readonly', (s) => s.getAllKeys(audioRange(r.id)));
@@ -796,7 +816,7 @@ function transcriptText(r) {
   if (r.transcript?.segments?.length) return r.transcript.segments.map((s) => `[${fmtTime(s.start)}] ${s.text.trim()}`).join('\n');
   return r.transcript?.text || r.liveText || '';
 }
-const DIAG_VERSION = 'v18';
+const DIAG_VERSION = 'v19';
 const rerun = new Set();
 // Nacharbeiten alter Aufnahmen tritt zurück, solange aufgenommen wird oder eine neue Aufnahme verarbeitet wird
 const priority = new Set();
@@ -957,13 +977,13 @@ function renderDetail() {
   const warn = $('#dWarn');
   const silent = [];
   for (const c of [...(r.chunks || [])].sort((a, b) => a.offset - b.offset)) {
-    if (!(c.size < 1000 && c.dur >= 10)) continue;
+    if (!(c.dur >= 10 && (c.size < 1000 || c.size / c.dur < 1500))) continue; // normal sind rund 10 KB pro Sekunde
     const last = silent[silent.length - 1];
     if (last && c.offset - last.to < 2) last.to = c.offset + c.dur; else silent.push({ from: c.offset, to: c.offset + c.dur });
   }
   const notes = [
     ...silent.map((g) => `${fmtTime(g.from)} bis ${fmtTime(g.to)}: Kein Ton aufgenommen, das Handy hatte das Mikrofon abgeschaltet.`),
-    ...(r.gaps || []).map((g) => g.missing
+    ...(r.gaps || []).filter((g) => g.missing || !silent.some((s) => g.from >= s.from - 1 && g.to <= s.to + 1)).map((g) => g.missing
       ? `${fmtTime(g.from)} bis ${fmtTime(g.to)}: Dieser Audioteil fehlt im Speicher.`
       : `${fmtTime(g.from)} bis ${fmtTime(g.to)}: Geräusche, aber keine Sprache erkannt. Bitte im Audio nachhören.`),
   ];
@@ -1246,6 +1266,7 @@ async function resumePending() {
     for (let r of recs) {
       if (rec.startedAt || Date.now() < limitUntil) break; // Aufnahme oder Limit geht vor, danach läuft es weiter
       if (r.status === 'recording') r = await updateRec(r.id, { status: 'pending' });
+      if (r.status !== 'recording' && r.chunks?.some((c) => !(c.offset >= 0))) r = await updateRec(r.id, fixOffsets);
       if ((r.pv ?? 1) < 2 && settings.groq && r.status !== 'pending') r = await updateRec(r.id, { pv: PV, parts: {}, redo: r.chunks.length > 0, resum: !!(r.chunks.length || r.transcript), backfill: true });
       else if (r.pv === 2 && settings.groq && r.status !== 'pending') {
         // Nur Abschnitte mit Ton, in denen Whisper ein ganzes Fenster ausgelassen hat, noch einmal anhören
